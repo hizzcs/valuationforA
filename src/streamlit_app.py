@@ -2,9 +2,10 @@ import os
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 
 from data_pipeline import fetch_financials, fetch_daily_price, fetch_basic
-from valuation import build_inputs, simple_dcf
+from valuation import build_inputs, simple_dcf, calc_wacc
 
 st.set_page_config(page_title="valuationforA", layout="wide")
 
@@ -20,12 +21,34 @@ h1, h2, h3 { font-weight: 700; }
 
 st.title("A股估值工作台 (Tushare Only)")
 
+# Presets
+presets = {
+    "保守": {"wacc": 0.10, "terminal_growth": 0.01, "growth_delta": -0.02},
+    "基准": {"wacc": 0.08, "terminal_growth": 0.02, "growth_delta": 0.0},
+    "激进": {"wacc": 0.06, "terminal_growth": 0.03, "growth_delta": 0.02},
+}
+
 with st.sidebar:
     st.header("核心参数")
     ts_code = st.text_input("股票代码", value="600519.SH")
-    wacc = st.slider("WACC", 0.04, 0.14, 0.08, 0.005)
-    terminal_growth = st.slider("终值增长率", 0.00, 0.05, 0.02, 0.002)
-    growth_delta = st.slider("收入/现金流增速调整", -0.05, 0.05, 0.0, 0.005)
+
+    preset = st.selectbox("参数模板", list(presets.keys()))
+    preset_vals = presets[preset]
+
+    wacc = st.slider("WACC", 0.04, 0.14, preset_vals["wacc"], 0.005)
+    terminal_growth = st.slider("终值增长率", 0.00, 0.05, preset_vals["terminal_growth"], 0.002)
+    growth_delta = st.slider("收入/现金流增速调整", -0.05, 0.05, preset_vals["growth_delta"], 0.005)
+
+    with st.expander("WACC 细化 (可选)"):
+        risk_free = st.slider("无风险利率", 0.01, 0.06, 0.03, 0.001)
+        beta = st.slider("Beta", 0.5, 2.0, 1.0, 0.05)
+        erp = st.slider("股权风险溢价", 0.03, 0.08, 0.05, 0.005)
+        cost_of_debt = st.slider("税前债务成本", 0.02, 0.08, 0.04, 0.002)
+        tax_rate = st.slider("税率", 0.10, 0.30, 0.20, 0.01)
+        debt_ratio = st.slider("债务占比", 0.0, 0.6, 0.2, 0.05)
+        if st.button("使用WACC推导值"):
+            wacc = calc_wacc(risk_free, beta, erp, cost_of_debt, tax_rate, debt_ratio)
+            st.success(f"WACC 计算结果：{wacc:.3f}")
 
     st.caption("需要环境变量 TUSHARE_TOKEN")
 
@@ -46,19 +69,21 @@ inputs = build_inputs(financials, wacc, terminal_growth, growth_delta)
 value = simple_dcf(inputs)
 
 # KPI
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 c1.metric("DCF估值", f"{value:,.0f}")
 if not price_df.empty:
     latest_price = float(price_df["close"].iloc[-1])
     c2.metric("最新价", f"{latest_price:,.2f}")
     mispricing = (value / latest_price - 1) if latest_price else 0
     c3.metric("估值偏离", f"{mispricing * 100:.2f}%")
+    c4.metric("安全边际", f"{(1-mispricing)*100:.1f}%" if latest_price else "-")
 else:
     c2.metric("最新价", "-")
     c3.metric("估值偏离", "-")
+    c4.metric("安全边际", "-")
 
 # Tabs
-overview_tab, sensitivity_tab, data_tab = st.tabs(["概览", "敏感性", "数据"])
+overview_tab, sensitivity_tab, chart_tab, data_tab = st.tabs(["概览", "敏感性", "图表", "数据"])
 
 with overview_tab:
     st.subheader("关键指标")
@@ -84,6 +109,14 @@ with sensitivity_tab:
     df_grid = pd.DataFrame(grid)
     fig = px.imshow(df_grid.pivot(index="Terminal", columns="WACC", values="Value"), text_auto=True)
     st.plotly_chart(fig, use_container_width=True)
+
+with chart_tab:
+    st.subheader("价格走势")
+    if not price_df.empty:
+        figp = go.Figure()
+        figp.add_trace(go.Scatter(x=price_df["trade_date"], y=price_df["close"], name="Close"))
+        figp.update_layout(title="历史价格", yaxis_title="Price")
+        st.plotly_chart(figp, use_container_width=True)
 
 with data_tab:
     st.subheader("原始数据")

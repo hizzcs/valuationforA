@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -15,8 +15,22 @@ class DcfInputs:
     growth_rates: tuple
 
 
+def calc_wacc(
+    risk_free: float,
+    beta: float,
+    equity_risk_premium: float,
+    cost_of_debt: float,
+    tax_rate: float,
+    debt_ratio: float,
+) -> float:
+    cost_of_equity = risk_free + beta * equity_risk_premium
+    equity_ratio = 1 - debt_ratio
+    wacc = equity_ratio * cost_of_equity + debt_ratio * cost_of_debt * (1 - tax_rate)
+    return float(wacc)
+
+
 def simple_dcf(inputs: DcfInputs) -> float:
-    """Very simplified DCF: project cashflow and discount."""
+    """Simplified DCF: project cashflow and discount."""
     cashflows = []
     cf = inputs.cashflow
     for g in inputs.growth_rates:
@@ -28,7 +42,16 @@ def simple_dcf(inputs: DcfInputs) -> float:
     return float(np.sum(discounted) + terminal_discounted)
 
 
-def build_inputs(financials: Dict[str, pd.DataFrame], wacc: float, terminal_growth: float, growth_delta: float) -> DcfInputs:
+def build_growth_path(base: float, delta: float, years: int = 5) -> Tuple[float, ...]:
+    return tuple(max(-0.05, min(0.20, base + delta)) for _ in range(years))
+
+
+def build_inputs(
+    financials: Dict[str, pd.DataFrame],
+    wacc: float,
+    terminal_growth: float,
+    growth_delta: float,
+) -> DcfInputs:
     income = financials["income"].sort_values("end_date").tail(1)
     cashflow = financials["cashflow"].sort_values("end_date").tail(1)
 
@@ -36,7 +59,7 @@ def build_inputs(financials: Dict[str, pd.DataFrame], wacc: float, terminal_grow
     net_profit = float(income["net_profit"].iloc[0]) if not income.empty else 0.0
     base_cf = float(cashflow["n_cashflow_act"].iloc[0]) if not cashflow.empty else 0.0
 
-    growth_rates = tuple(max(-0.05, min(0.20, 0.05 + growth_delta)) for _ in range(5))
+    growth_rates = build_growth_path(0.05, growth_delta, years=5)
 
     return DcfInputs(
         base_revenue=base_revenue,
