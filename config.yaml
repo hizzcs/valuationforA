@@ -1,0 +1,11 @@
+project:
+  name: valuationforA
+settings:
+  data_source: tushare
+  lookback_years: 5
+  currency: CNY
+ui:
+  theme: interactive
+notes:
+  - "Single source: Tushare only"
+  - "Set TUSHARE_TOKEN in environment"
