@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 
 from data_pipeline import fetch_financials, fetch_daily_price, fetch_basic
 from valuation import build_inputs, simple_dcf, calc_wacc
+from reporting import generate_report
 
 st.set_page_config(page_title="valuationforA", layout="wide")
 
@@ -127,3 +128,26 @@ with data_tab:
     if not price_df.empty:
         st.write("价格")
         st.dataframe(price_df.tail(10))
+
+# Report
+assumptions = {
+    "WACC": wacc,
+    "terminal_growth": terminal_growth,
+    "growth_delta": growth_delta,
+}
+inputs_payload = {
+    "base_revenue": inputs.base_revenue,
+    "net_profit": inputs.net_profit,
+    "cashflow": inputs.cashflow,
+}
+report_payload = {
+    "ts_code": ts_code,
+    "name": name,
+    "valuation": value,
+    "mispricing": mispricing if not price_df.empty else None,
+    "inputs": inputs_payload,
+    "assumptions": assumptions,
+}
+report_md = generate_report(report_payload)
+
+st.download_button("下载估值报告 (Markdown)", report_md, file_name=f"{ts_code}_valuation.md")
