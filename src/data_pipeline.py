@@ -44,3 +44,13 @@ def fetch_basic(ts_code: str) -> Optional[pd.DataFrame]:
     pro = TushareClient(get_token()).pro()
     df = pro.stock_basic(ts_code=ts_code, fields="ts_code,name,industry,area,market")
     return df
+
+
+def fetch_daily_basic(ts_code: str) -> Optional[pd.DataFrame]:
+    pro = TushareClient(get_token()).pro()
+    df = pro.daily_basic(ts_code=ts_code, fields="ts_code,trade_date,total_mv,circ_mv")
+    if df is None or df.empty:
+        return None
+    df = df.sort_values("trade_date")
+    df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d", errors="coerce")
+    return df

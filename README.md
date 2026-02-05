@@ -20,3 +20,4 @@ streamlit run src/streamlit_app.py
 ## Notes
 - Single data source: Tushare
 - If data fails to load, check token and network
+- TODO (human input): confirm net debt calculation and shares outstanding logic

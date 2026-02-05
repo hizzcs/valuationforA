@@ -13,6 +13,8 @@ class DcfInputs:
     wacc: float
     terminal_growth: float
     growth_rates: tuple
+    shares_outstanding: float = 1.0
+    net_debt: float = 0.0
 
 
 def calc_wacc(
@@ -30,7 +32,7 @@ def calc_wacc(
 
 
 def simple_dcf(inputs: DcfInputs) -> float:
-    """Simplified DCF: project cashflow and discount."""
+    """Simplified DCF: project cashflow and discount (enterprise value)."""
     cashflows = []
     cf = inputs.cashflow
     for g in inputs.growth_rates:
@@ -42,6 +44,12 @@ def simple_dcf(inputs: DcfInputs) -> float:
     return float(np.sum(discounted) + terminal_discounted)
 
 
+def equity_value_per_share(enterprise_value: float, net_debt: float, shares_outstanding: float) -> float:
+    if shares_outstanding <= 0:
+        return 0.0
+    return float((enterprise_value - net_debt) / shares_outstanding)
+
+
 def build_growth_path(base: float, delta: float, years: int = 5) -> Tuple[float, ...]:
     return tuple(max(-0.05, min(0.20, base + delta)) for _ in range(years))
 
@@ -51,6 +59,8 @@ def build_inputs(
     wacc: float,
     terminal_growth: float,
     growth_delta: float,
+    shares_outstanding: float,
+    net_debt: float,
 ) -> DcfInputs:
     income = financials["income"].sort_values("end_date").tail(1)
     cashflow = financials["cashflow"].sort_values("end_date").tail(1)
@@ -68,4 +78,6 @@ def build_inputs(
         wacc=wacc,
         terminal_growth=terminal_growth,
         growth_rates=growth_rates,
+        shares_outstanding=shares_outstanding,
+        net_debt=net_debt,
     )

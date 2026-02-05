@@ -4,8 +4,8 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
-from data_pipeline import fetch_financials, fetch_daily_price, fetch_basic
-from valuation import build_inputs, simple_dcf, calc_wacc
+from data_pipeline import fetch_financials, fetch_daily_price, fetch_basic, fetch_daily_basic
+from valuation import build_inputs, simple_dcf, calc_wacc, equity_value_per_share
 from reporting import generate_report
 
 st.set_page_config(page_title="valuationforA", layout="wide")
@@ -58,6 +58,7 @@ try:
     basic = fetch_basic(ts_code)
     financials = fetch_financials(ts_code)
     price_df = fetch_daily_price(ts_code)
+    daily_basic = fetch_daily_basic(ts_code)
 except Exception as e:
     st.error(f"数据加载失败：{e}")
     st.stop()
@@ -65,9 +66,19 @@ except Exception as e:
 name = basic["name"].iloc[0] if basic is not None and not basic.empty else ts_code
 st.subheader(f"{name} ({ts_code})")
 
-# Valuation
-inputs = build_inputs(financials, wacc, terminal_growth, growth_delta)
-value = simple_dcf(inputs)
+# Valuation inputs
+shares_outstanding = 1.0
+net_debt = 0.0
+if daily_basic is not None and not daily_basic.empty:
+    latest_mv = float(daily_basic["total_mv"].iloc[-1])
+    latest_price_for_mv = float(price_df["close"].iloc[-1]) if not price_df.empty else None
+    if latest_price_for_mv and latest_price_for_mv > 0:
+        shares_outstanding = (latest_mv * 1e4) / latest_price_for_mv  # total_mv in 10k CNY
+
+# TODO (needs human input): net debt from balance sheet / latest report
+inputs = build_inputs(financials, wacc, terminal_growth, growth_delta, shares_outstanding, net_debt)
+enterprise_value = simple_dcf(inputs)
+value = equity_value_per_share(enterprise_value, net_debt, shares_outstanding)
 
 # KPI
 c1, c2, c3, c4 = st.columns(4)
@@ -92,6 +103,8 @@ with overview_tab:
         "base_revenue": inputs.base_revenue,
         "net_profit": inputs.net_profit,
         "cashflow": inputs.cashflow,
+        "shares_outstanding": f"{inputs.shares_outstanding:,.0f}",
+        "net_debt": inputs.net_debt,
     })
 
 with sensitivity_tab:
@@ -104,8 +117,9 @@ with sensitivity_tab:
             if w <= g:
                 val = None
             else:
-                temp_inputs = build_inputs(financials, w, g, growth_delta)
-                val = simple_dcf(temp_inputs)
+                temp_inputs = build_inputs(financials, w, g, growth_delta, shares_outstanding, net_debt)
+                ev = simple_dcf(temp_inputs)
+                val = equity_value_per_share(ev, net_debt, shares_outstanding)
             grid.append({"WACC": w, "Terminal": g, "Value": val})
     df_grid = pd.DataFrame(grid)
     fig = px.imshow(df_grid.pivot(index="Terminal", columns="WACC", values="Value"), text_auto=True)
@@ -139,6 +153,8 @@ inputs_payload = {
     "base_revenue": inputs.base_revenue,
     "net_profit": inputs.net_profit,
     "cashflow": inputs.cashflow,
+    "shares_outstanding": inputs.shares_outstanding,
+    "net_debt": inputs.net_debt,
 }
 report_payload = {
     "ts_code": ts_code,
