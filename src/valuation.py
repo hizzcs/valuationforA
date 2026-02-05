@@ -81,3 +81,14 @@ def build_inputs(
         shares_outstanding=shares_outstanding,
         net_debt=net_debt,
     )
+
+
+def filter_non_financial(df: pd.DataFrame) -> pd.DataFrame:
+    """Filter out financial industries (banking/insurance/securities/multi-finance)."""
+    fin_industries = {'银行','保险','证券','多元金融'}
+    return df[~df['industry'].isin(fin_industries)]
+
+
+def rank_stocks_by_mispricing(df: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
+    """Rank stocks by mispricing (highest first, filter out NaNs)."""
+    return df.dropna(subset=['mispricing']).sort_values('mispricing', ascending=False).head(top_n)

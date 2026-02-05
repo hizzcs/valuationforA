@@ -4,8 +4,22 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 
-from data_pipeline import fetch_financials, fetch_daily_price, fetch_basic, fetch_daily_basic
-from valuation import build_inputs, simple_dcf, calc_wacc, equity_value_per_share
+from data_pipeline import (
+    fetch_financials,
+    fetch_daily_price,
+    fetch_basic,
+    fetch_daily_basic,
+    fetch_index_weight,
+    fetch_all_stock_basic,
+)
+from valuation import (
+    build_inputs,
+    simple_dcf,
+    calc_wacc,
+    equity_value_per_share,
+    filter_non_financial,
+    rank_stocks_by_mispricing,
+)
 from reporting import generate_report
 
 st.set_page_config(page_title="valuationforA", layout="wide")
@@ -95,7 +109,7 @@ else:
     c4.metric("安全边际", "-")
 
 # Tabs
-overview_tab, sensitivity_tab, chart_tab, data_tab = st.tabs(["概览", "敏感性", "图表", "数据"])
+overview_tab, sensitivity_tab, chart_tab, data_tab, ranking_tab = st.tabs(["概览", "敏感性", "图表", "数据", "推荐"])
 
 with overview_tab:
     st.subheader("关键指标")
@@ -142,6 +156,77 @@ with data_tab:
     if not price_df.empty:
         st.write("价格")
         st.dataframe(price_df.tail(10))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _quick_valuation(ts_code: str, wacc: float, terminal_growth: float, growth_delta: float):
+    financials = fetch_financials(ts_code)
+    price_df = fetch_daily_price(ts_code)
+    daily_basic = fetch_daily_basic(ts_code)
+    if price_df.empty or daily_basic is None or daily_basic.empty:
+        return None
+
+    latest_mv = float(daily_basic["total_mv"].iloc[-1])
+    latest_price_for_mv = float(price_df["close"].iloc[-1])
+    shares_outstanding = (latest_mv * 1e4) / latest_price_for_mv if latest_price_for_mv > 0 else 1.0
+    net_debt = 0.0
+
+    inputs = build_inputs(financials, wacc, terminal_growth, growth_delta, shares_outstanding, net_debt)
+    enterprise_value = simple_dcf(inputs)
+    per_share = equity_value_per_share(enterprise_value, net_debt, shares_outstanding)
+    price = float(price_df["close"].iloc[-1])
+    mispricing = (per_share / price - 1) if price > 0 else None
+
+    return {
+        "per_share_value": per_share,
+        "price": price,
+        "mispricing": mispricing,
+    }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _build_universe(index_code: str, limit: int, exclude_financial: bool):
+    weights = fetch_index_weight(index_code, limit=limit)
+    basic_all = fetch_all_stock_basic()
+    merged = weights.merge(basic_all, left_on="con_code", right_on="ts_code", how="left")
+    if exclude_financial:
+        merged = filter_non_financial(merged)
+    return merged
+
+
+with ranking_tab:
+    st.subheader("价值推荐（粗筛）")
+    st.caption("当前为简化 DCF + 统一参数，适合初筛；非最终投资结论。")
+
+    index_map = {
+        "上证50": "000016.SH",
+        "沪深300": "000300.SH",
+        "中证500": "000905.SH",
+    }
+    idx_name = st.selectbox("指数池", list(index_map.keys()), index=1)
+    limit = st.slider("取前N权重成分", 20, 200, 50, 10)
+    top_n = st.slider("输出TopN", 5, 50, 15, 5)
+    exclude_fin = st.checkbox("剔除金融", value=True)
+
+    if st.button("开始筛选"):
+        universe = _build_universe(index_map[idx_name], limit, exclude_fin)
+        results = []
+        progress = st.progress(0.0)
+        for i, row in universe.iterrows():
+            ts_code = row["con_code"]
+            val = _quick_valuation(ts_code, wacc, terminal_growth, growth_delta)
+            if val:
+                results.append({
+                    "ts_code": ts_code,
+                    "name": row.get("name", ""),
+                    "industry": row.get("industry", ""),
+                    "weight": row.get("weight", None),
+                    **val,
+                })
+            progress.progress((i + 1) / max(1, len(universe)))
+        res_df = pd.DataFrame(results)
+        ranked = rank_stocks_by_mispricing(res_df, top_n=top_n)
+        st.dataframe(ranked, use_container_width=True)
 
 # Report
 assumptions = {
