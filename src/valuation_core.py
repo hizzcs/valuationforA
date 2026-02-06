@@ -3,10 +3,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
+
+from loguru import logger
 
 from .data_pipeline import ValidatedInputs
 from .risk_params import RiskProfile
@@ -23,17 +25,39 @@ class ValuationResult:
     terminal_value: float
     assumptions: Dict[str, float]
     metadata: Dict[str, str]
+    terminal_method: str = "perpetual"
+    terminal_exit_multiple: Optional[float] = None
 
 
-def _historical_growth(series: pd.Series) -> float:
+def _historical_growth(series: pd.Series, method: str = "cagr") -> float:
+    """
+    Calculate historical growth rate with multiple methods.
+
+    Args:
+        series: Historical financial data series
+        method: Growth calculation method ("cagr" or "linear")
+
+    Returns:
+        float: Estimated growth rate
+    """
     series = pd.to_numeric(series, errors="coerce").dropna().tail(6)
     if len(series) < 2:
         return 0.05
-    start, end = series.iloc[0], series.iloc[-1]
-    periods = len(series) - 1
-    if start <= 0:
-        return 0.05
-    return float((end / start) ** (1 / periods) - 1)
+
+    if method == "cagr":
+        start, end = series.iloc[0], series.iloc[-1]
+        periods = len(series) - 1
+        if start <= 0:
+            return 0.05
+        return float((end / start) ** (1 / periods) - 1)
+    elif method == "linear":
+        x = np.arange(len(series))
+        y = series.values
+        slope, _ = np.polyfit(x, np.log(y + 1e-9), 1)
+        return float(np.exp(slope) - 1)
+    else:
+        logger.warning(f"Unknown growth method: {method}, defaulting to CAGR")
+        return _historical_growth(series, "cagr")
 
 
 def _operating_margin(fin: pd.DataFrame, fallback: float) -> float:
@@ -46,7 +70,10 @@ def _operating_margin(fin: pd.DataFrame, fallback: float) -> float:
     margins = (profit / revenue).replace([np.inf, -np.inf], np.nan).dropna()
     if margins.empty:
         return float(np.clip(fallback, -0.2, 0.5))
-    return float(np.clip(margins.tail(4).mean(), -0.2, 0.5))
+    margin_mean = margins.tail(4).mean()
+    margin_median = margins.tail(4).median()
+    margin = (margin_mean + margin_median) / 2
+    return float(np.clip(margin, -0.2, 0.5))
 
 
 def _roic(fin: pd.DataFrame) -> float:
@@ -61,7 +88,10 @@ def _roic(fin: pd.DataFrame) -> float:
             ratios.append(prof / capital)
     if not ratios:
         return 0.1
-    return float(np.clip(np.nanmean(ratios[-4:]), 0.01, 0.4))
+    roic_mean = np.nanmean(ratios[-4:])
+    roic_median = np.nanmedian(ratios[-4:])
+    roic = (roic_mean + roic_median) / 2
+    return float(np.clip(roic, 0.01, 0.4))
 
 
 def _reinvestment_rate(fin: pd.DataFrame, default: float = 0.3) -> float:
@@ -89,9 +119,22 @@ def _determine_fade_years(fin: pd.DataFrame, fallback: int = 5) -> int:
     return derived if periods > 1 else fallback
 
 
-def _terminal_value(last_cf: float, wacc: float, growth: float) -> float:
-    spread = max(wacc - growth, 0.005)
-    return last_cf * (1 + growth) / spread
+def _terminal_value(
+    last_cf: float,
+    wacc: float,
+    terminal_growth: float,
+    terminal_method: str = "perpetual",
+    exit_multiple: Optional[float] = None,
+    last_nopat: Optional[float] = None,
+) -> float:
+    if terminal_method == "exit_multiple" and exit_multiple and last_nopat:
+        return last_nopat * exit_multiple
+    elif terminal_method == "perpetual":
+        spread = max(wacc - terminal_growth, 0.005)
+        return last_cf * (1 + terminal_growth) / spread
+    else:
+        logger.warning(f"Unknown terminal method: {terminal_method}, defaulting to perpetual")
+        return _terminal_value(last_cf, wacc, terminal_growth)
 
 
 def _valuation_metadata(validated: ValidatedInputs) -> Dict[str, str]:
@@ -114,14 +157,21 @@ def revenue_driven_dcf(
     horizon: int = 5,
     fade_years: Optional[int] = None,
     terminal_growth: float = 0.02,
+    terminal_method: str = "perpetual",
+    exit_multiple: Optional[float] = None,
+    growth_method: str = "cagr",
 ) -> ValuationResult:
     fade = fade_years if fade_years is not None else _determine_fade_years(validated.statements)
-    revenue_growth = _historical_growth(validated.statements.get("revenue", pd.Series(dtype=float)))
+    revenue_growth = _historical_growth(
+        validated.statements.get("revenue", pd.Series(dtype=float)),
+        method=growth_method,
+    )
     fallback_margin = validated.net_profit / max(validated.revenue, 1.0)
     operating_margin = _operating_margin(validated.statements, fallback_margin)
     reinvestment_rate = _reinvestment_rate(validated.statements)
     cash_flows: List[float] = []
     revenue = validated.revenue
+    last_nopat: Optional[float] = None
     for year in range(1, horizon + 1):
         fade_factor = max(0.0, 1 - (year - 1) / max(fade, 1))
         growth = terminal_growth + (revenue_growth - terminal_growth) * fade_factor
@@ -130,10 +180,18 @@ def revenue_driven_dcf(
         reinvestment = nopat * reinvestment_rate
         fcff = nopat - reinvestment
         cash_flows.append(fcff)
+        last_nopat = nopat
     discount_rate = max(risk.wacc, 0.01)
     discount = _discount_factors(discount_rate, horizon)
     pv_flows = sum(cf * df for cf, df in zip(cash_flows, discount))
-    terminal_value = _terminal_value(cash_flows[-1], discount_rate, terminal_growth)
+    terminal_value = _terminal_value(
+        cash_flows[-1],
+        discount_rate,
+        terminal_growth,
+        terminal_method,
+        exit_multiple,
+        last_nopat,
+    )
     pv_terminal = terminal_value / ((1 + discount_rate) ** horizon)
     intrinsic = pv_flows + pv_terminal
     assumptions = {
@@ -143,6 +201,8 @@ def revenue_driven_dcf(
         "terminal_growth": terminal_growth,
         "wacc": discount_rate,
         "fade_years": fade,
+        "exit_multiple": exit_multiple,
+        "growth_method": growth_method,
     }
     metadata = _valuation_metadata(validated)
     return ValuationResult(
@@ -155,6 +215,8 @@ def revenue_driven_dcf(
         terminal_value=terminal_value,
         assumptions=assumptions,
         metadata=metadata,
+        terminal_method=terminal_method,
+        terminal_exit_multiple=exit_multiple,
     )
 
 
@@ -164,12 +226,15 @@ def roic_driven_dcf(
     horizon: int = 5,
     fade_years: Optional[int] = None,
     terminal_growth: float = 0.02,
+    terminal_method: str = "perpetual",
+    exit_multiple: Optional[float] = None,
 ) -> ValuationResult:
     fade = fade_years if fade_years is not None else _determine_fade_years(validated.statements)
     roic = max(_roic(validated.statements), 0.01)
     reinvestment_rate = _reinvestment_rate(validated.statements)
     invested_capital = max(validated.invested_capital, 1.0)
     cash_flows: List[float] = []
+    last_nopat: Optional[float] = None
     for year in range(1, horizon + 1):
         fade_factor = max(0.0, 1 - (year - 1) / max(fade, 1))
         roic_year = terminal_growth + (roic - terminal_growth) * fade_factor
@@ -178,10 +243,18 @@ def roic_driven_dcf(
         reinvestment = invested_capital * reinvestment_rate
         fcff = nopat - reinvestment
         cash_flows.append(fcff)
+        last_nopat = nopat
     discount_rate = max(risk.wacc, 0.01)
     discount = _discount_factors(discount_rate, horizon)
     pv_flows = sum(cf * df for cf, df in zip(cash_flows, discount))
-    terminal_value = _terminal_value(cash_flows[-1], discount_rate, terminal_growth)
+    terminal_value = _terminal_value(
+        cash_flows[-1],
+        discount_rate,
+        terminal_growth,
+        terminal_method,
+        exit_multiple,
+        last_nopat,
+    )
     pv_terminal = terminal_value / ((1 + discount_rate) ** horizon)
     intrinsic = pv_flows + pv_terminal
     assumptions = {
@@ -190,6 +263,7 @@ def roic_driven_dcf(
         "terminal_growth": terminal_growth,
         "wacc": discount_rate,
         "fade_years": fade,
+        "exit_multiple": exit_multiple,
     }
     metadata = _valuation_metadata(validated)
     return ValuationResult(
@@ -202,7 +276,88 @@ def roic_driven_dcf(
         terminal_value=terminal_value,
         assumptions=assumptions,
         metadata=metadata,
+        terminal_method=terminal_method,
+        terminal_exit_multiple=exit_multiple,
     )
 
 
-__all__ = ["ValuationResult", "revenue_driven_dcf", "roic_driven_dcf"]
+def two_stage_dcf(
+    validated: ValidatedInputs,
+    risk: RiskProfile,
+    high_growth_years: int = 3,
+    stable_growth_years: int = 2,
+    high_growth_rate: Optional[float] = None,
+    stable_growth_rate: float = 0.02,
+    terminal_method: str = "perpetual",
+    exit_multiple: Optional[float] = None,
+    growth_method: str = "cagr",
+) -> ValuationResult:
+    horizon = high_growth_years + stable_growth_years
+    fallback_margin = validated.net_profit / max(validated.revenue, 1.0)
+    operating_margin = _operating_margin(validated.statements, fallback_margin)
+    reinvestment_rate = _reinvestment_rate(validated.statements)
+
+    if high_growth_rate is None:
+        high_growth_rate = _historical_growth(
+            validated.statements.get("revenue", pd.Series(dtype=float)),
+            method=growth_method,
+        )
+
+    cash_flows: List[float] = []
+    revenue = validated.revenue
+    last_nopat: Optional[float] = None
+    for year in range(1, horizon + 1):
+        if year <= high_growth_years:
+            growth = high_growth_rate
+        else:
+            fade_factor = (year - high_growth_years) / stable_growth_years
+            growth = high_growth_rate + fade_factor * (stable_growth_rate - high_growth_rate)
+
+        revenue *= 1 + growth
+        nopat = revenue * operating_margin
+        reinvestment = nopat * reinvestment_rate
+        fcff = nopat - reinvestment
+        cash_flows.append(fcff)
+        last_nopat = nopat
+
+    discount_rate = max(risk.wacc, 0.01)
+    discount = _discount_factors(discount_rate, horizon)
+    pv_flows = sum(cf * df for cf, df in zip(cash_flows, discount))
+    terminal_value = _terminal_value(
+        cash_flows[-1],
+        discount_rate,
+        stable_growth_rate,
+        terminal_method,
+        exit_multiple,
+        last_nopat,
+    )
+    pv_terminal = terminal_value / ((1 + discount_rate) ** horizon)
+    intrinsic = pv_flows + pv_terminal
+    assumptions = {
+        "high_growth_rate": high_growth_rate,
+        "stable_growth_rate": stable_growth_rate,
+        "operating_margin": operating_margin,
+        "reinvestment_rate": reinvestment_rate,
+        "wacc": discount_rate,
+        "high_growth_years": high_growth_years,
+        "stable_growth_years": stable_growth_years,
+        "exit_multiple": exit_multiple,
+        "growth_method": growth_method,
+    }
+    metadata = _valuation_metadata(validated)
+    return ValuationResult(
+        ticker=validated.ticker,
+        as_of_date=validated.as_of_date,
+        method="two_stage",
+        intrinsic_value=intrinsic,
+        cash_flows=cash_flows,
+        discount_factors=discount,
+        terminal_value=terminal_value,
+        assumptions=assumptions,
+        metadata=metadata,
+        terminal_method=terminal_method,
+        terminal_exit_multiple=exit_multiple,
+    )
+
+
+__all__ = ["ValuationResult", "revenue_driven_dcf", "roic_driven_dcf", "two_stage_dcf"]
