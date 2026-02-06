@@ -1,78 +1,455 @@
-import os
-from dataclasses import dataclass
-from typing import Optional
+"""Data ingestion, verification, and caching utilities for the valuation platform."""
+from __future__ import annotations
 
+import hashlib
+import json
+import os
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Dict, Optional
+
+try:
+    import duckdb
+except Exception:  # pragma: no cover - duckdb optional for tests
+    duckdb = None  # type: ignore
 import pandas as pd
-import tushare as ts
+from loguru import logger
+
+try:  # Optional TuShare import for environments with the package installed
+    import tushare as ts
+except Exception:  # pragma: no cover - offline environments
+    ts = None  # type: ignore
+
+try:  # Optional yfinance fallback for CSI300
+    import yfinance as yf
+except Exception:  # pragma: no cover
+    yf = None  # type: ignore
+REPO_ROOT = Path(__file__).resolve().parents[1]
+FIXTURE_DIR = REPO_ROOT / "tests" / "data"
+DUCKDB_PATH = REPO_ROOT / "duckdb" / "valuation.duckdb"
 
 
 @dataclass
-class TushareClient:
-    token: str
-
-    def pro(self):
-        return ts.pro_api(self.token)
-
-
-def get_token() -> str:
-    token = os.environ.get("TUSHARE_TOKEN")
-    if not token:
-        raise ValueError("TUSHARE_TOKEN not set")
-    return token
-
-
-def fetch_financials(ts_code: str) -> dict:
-    """Fetch basic financial statements from Tushare."""
-    pro = TushareClient(get_token()).pro()
-    income = pro.income(ts_code=ts_code, fields="ts_code,ann_date,f_ann_date,end_date,report_type,net_profit,revenue")
-    balance = pro.balancesheet(ts_code=ts_code, fields="ts_code,ann_date,end_date,total_assets,total_liab")
-    cashflow = pro.cashflow(ts_code=ts_code, fields="ts_code,ann_date,end_date,n_cashflow_act")
-    return {"income": income, "balance": balance, "cashflow": cashflow}
+class ValidatedInputs:
+    ticker: str
+    as_of_date: date
+    revenue: float
+    net_profit: float
+    net_debt: float
+    operating_cf: float
+    invested_capital: float
+    verification: Dict[str, str]
+    data_quality_grade: str
+    metadata: Dict[str, str] = field(default_factory=dict)
+    statements: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
-def fetch_daily_price(ts_code: str) -> pd.DataFrame:
-    pro = TushareClient(get_token()).pro()
-    df = pro.daily(ts_code=ts_code, fields="ts_code,trade_date,close")
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df = df.sort_values("trade_date")
-    df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d", errors="coerce")
+class TuShareClient:
+    """Wrapper around TuShare that logs every call and falls back to fixtures."""
+
+    def __init__(self, token: Optional[str] = None, fixtures_dir: Path = FIXTURE_DIR):
+        self.token = token or os.getenv("TUSHARE_TOKEN")
+        self.fixtures_dir = fixtures_dir
+        self._pro = None
+        self.last_call: Dict[str, str] = {}
+        if self.token and ts is not None:
+            try:
+                self._pro = ts.pro_api(self.token)
+                logger.info("Initialized TuShare client with provided token.")
+            except Exception as exc:  # pragma: no cover - runtime failure path
+                logger.warning("Failed to init TuShare, falling back to fixtures: {}", exc)
+        else:
+            logger.info("TuShare token missing; operating in fixture mode.")
+
+    @property
+    def mode(self) -> str:
+        return "live" if self._pro is not None else "fixture"
+
+    def call_api(self, endpoint: str, **params) -> pd.DataFrame:
+        start = datetime.now(timezone.utc)
+        cache_key = _hash_params(endpoint, params)
+        if self._pro is not None:
+            try:
+                func = getattr(self._pro, endpoint)
+                df = func(**params)
+                duration = (datetime.now(timezone.utc) - start).total_seconds()
+                self.last_call = {
+                    "endpoint": endpoint,
+                    "mode": "live",
+                    "cache_key": cache_key,
+                    "duration": f"{duration:.3f}",
+                }
+                logger.info(
+                    "TuShare call endpoint={} rows={} cache_key={} duration={:.3f}s mode=live",
+                    endpoint,
+                    len(df) if hasattr(df, "__len__") else "na",
+                    cache_key,
+                    duration,
+                )
+                return pd.DataFrame(df)
+            except Exception as exc:  # pragma: no cover
+                logger.error("TuShare call failed ({}): {} -- falling back to fixtures", endpoint, exc)
+        fixture_path = self.fixtures_dir / f"{endpoint}.csv"
+        if not fixture_path.exists():
+            if endpoint == "csi300" and yf is not None:
+                logger.warning("Fixture missing for CSI300, downloading via yfinance fallback.")
+                data = yf.download("000300.SS", period="1y", progress=False)
+                df = (
+                    data.reset_index()
+                    .rename(columns={"Date": "trade_date", "Close": "close"})[["trade_date", "close"]]
+                )
+                df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.strftime("%Y-%m-%d")
+                duration = (datetime.now(timezone.utc) - start).total_seconds()
+                self.last_call = {
+                    "endpoint": endpoint,
+                    "mode": "fallback",
+                    "cache_key": cache_key,
+                    "duration": f"{duration:.3f}",
+                }
+                logger.info(
+                    "CSI300 yfinance fallback rows={} cache_key={} duration={:.3f}s",
+                    len(df),
+                    cache_key,
+                    duration,
+                )
+                return df
+            raise FileNotFoundError(f"Fixture {fixture_path} missing for endpoint {endpoint}")
+        df = pd.read_csv(fixture_path)
+        ts_code = params.get("ts_code")
+        if ts_code and "ts_code" in df.columns:
+            df = df[df["ts_code"] == ts_code]
+        duration = (datetime.now(timezone.utc) - start).total_seconds()
+        self.last_call = {
+            "endpoint": endpoint,
+            "mode": "fixture",
+            "cache_key": cache_key,
+            "duration": f"{duration:.3f}",
+        }
+        logger.info(
+            "Loaded fixture endpoint={} rows={} cache_key={} duration={:.3f}s mode=fixture",
+            endpoint,
+            len(df),
+            cache_key,
+            duration,
+        )
+        return df
+
+
+def ensure_duckdb_schema(path: Path = DUCKDB_PATH) -> None:
+    if duckdb is None:
+        logger.warning("duckdb package missing; skipping schema creation.")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        con = duckdb.connect(path.as_posix())
+    except Exception as exc:
+        # A zero-byte file is common when repos accidentally commit an empty placeholder.
+        if path.exists() and path.stat().st_size == 0:
+            logger.warning("DuckDB file {} is empty; recreating it.", path)
+            path.unlink(missing_ok=True)
+            con = duckdb.connect(path.as_posix())
+        elif path.exists() and "not a valid duckdb database file" in str(exc).lower():
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+            backup = path.with_name(f"{path.name}.invalid-{stamp}")
+            path.rename(backup)
+            logger.warning("Invalid DuckDB file moved to {}; recreating {}.", backup, path)
+            con = duckdb.connect(path.as_posix())
+        else:
+            raise
+    try:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS valuation_runs (
+                id UUID DEFAULT uuid(),
+                ticker TEXT,
+                as_of_date DATE,
+                method TEXT,
+                intrinsic_value DOUBLE,
+                percentile_5 DOUBLE,
+                percentile_50 DOUBLE,
+                percentile_95 DOUBLE,
+                scenario_seed INTEGER,
+                scenario_inputs JSON,
+                wacc_details JSON,
+                data_quality_grade TEXT,
+                source_mode TEXT,
+                created_at TIMESTAMP DEFAULT current_timestamp
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS risk_profiles (
+                id UUID DEFAULT uuid(),
+                ticker TEXT,
+                as_of_date DATE,
+                beta DOUBLE,
+                risk_free DOUBLE,
+                cost_of_equity DOUBLE,
+                cost_of_debt DOUBLE,
+                wacc DOUBLE,
+                observations INTEGER,
+                std_err DOUBLE,
+                trace JSON,
+                window_start DATE,
+                window_end DATE,
+                created_at TIMESTAMP DEFAULT current_timestamp
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS valuation_alerts (
+                id UUID DEFAULT uuid(),
+                ticker TEXT,
+                alert_type TEXT,
+                message TEXT,
+                severity TEXT,
+                created_at TIMESTAMP DEFAULT current_timestamp
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS valuation_backtest (
+                id UUID DEFAULT uuid(),
+                ticker TEXT,
+                valuation_date DATE,
+                forward_return DOUBLE,
+                realized_vs_intrinsic DOUBLE,
+                notes TEXT,
+                created_at TIMESTAMP DEFAULT current_timestamp
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS raw_prices (
+                ticker TEXT,
+                trade_date DATE,
+                close DOUBLE
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS raw_financials (
+                ticker TEXT,
+                end_date DATE,
+                revenue DOUBLE,
+                net_profit DOUBLE,
+                net_debt DOUBLE,
+                operating_cf DOUBLE,
+                invested_capital DOUBLE
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS macro_series (
+                series TEXT,
+                obs_date DATE,
+                value DOUBLE
+            )
+            """
+        )
+    finally:
+        con.close()
+
+
+def cache_dataframe(table: str, df: pd.DataFrame, path: Path = DUCKDB_PATH) -> None:
+    if df.empty:
+        return
+    if duckdb is None:
+        logger.warning("duckdb package missing; skip caching table={}", table)
+        return
+    ensure_duckdb_schema(path)
+    con = duckdb.connect(path.as_posix())
+    try:
+        table_cols = [row[1] for row in con.execute(f"PRAGMA table_info('{table}')").fetchall()]
+        if not table_cols:
+            raise ValueError(f"Unknown table {table}")
+
+        normalized = df.copy()
+        if "ticker" in table_cols and "ticker" not in normalized.columns and "ts_code" in normalized.columns:
+            normalized = normalized.rename(columns={"ts_code": "ticker"})
+        for col in table_cols:
+            if col not in normalized.columns:
+                normalized[col] = pd.NA
+        normalized = normalized[table_cols]
+        con.register("df", normalized)
+
+        identifier_col = None
+        if "ticker" in table_cols and "ticker" in normalized.columns:
+            identifier_col = "ticker"
+        elif "ts_code" in table_cols and "ts_code" in normalized.columns:
+            identifier_col = "ts_code"
+        if identifier_col:
+            ids = normalized[identifier_col].dropna().unique().tolist()
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                con.execute(f"DELETE FROM {table} WHERE {identifier_col} IN ({placeholders})", ids)
+        else:
+            con.execute(f"DELETE FROM {table}")
+        quoted_cols = ", ".join(f'"{col}"' for col in table_cols)
+        con.execute(f"INSERT INTO {table} ({quoted_cols}) SELECT {quoted_cols} FROM df")
+    finally:
+        con.close()
+
+
+def load_financials(client: TuShareClient, ticker: str, as_of: Optional[date] = None) -> pd.DataFrame:
+    df = client.call_api("financials", ts_code=ticker)
+    if df.empty:
+        return df
+    df["end_date"] = pd.to_datetime(df["end_date"])
+    if as_of is not None:
+        df = df[df["end_date"] <= pd.Timestamp(as_of)]
+    if df.empty:
+        return df
+    df = df.sort_values("end_date")
+    for col in ["revenue", "net_profit", "net_debt", "operating_cf", "invested_capital"]:
+        if col in df:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ["interest_expense", "total_debt"]:
+        if col in df:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    cache_dataframe("raw_financials", df)
     return df
 
 
-def fetch_basic(ts_code: str) -> Optional[pd.DataFrame]:
-    pro = TushareClient(get_token()).pro()
-    df = pro.stock_basic(ts_code=ts_code, fields="ts_code,name,industry,area,market")
+def load_prices(client: TuShareClient, ticker: str, as_of: Optional[date] = None) -> pd.DataFrame:
+    df = client.call_api("daily", ts_code=ticker)
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    if as_of is not None:
+        df = df[df["trade_date"] <= pd.Timestamp(as_of)]
+    df = df.sort_values("trade_date")[["ts_code", "trade_date", "close"]]
+    cache_dataframe("raw_prices", df.rename(columns={"ts_code": "ticker"}))
     return df
 
 
-def fetch_daily_basic(ts_code: str) -> Optional[pd.DataFrame]:
-    pro = TushareClient(get_token()).pro()
-    df = pro.daily_basic(ts_code=ts_code, fields="ts_code,trade_date,total_mv,circ_mv")
-    if df is None or df.empty:
-        return None
-    df = df.sort_values("trade_date")
-    df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d", errors="coerce")
+def load_macro_series(client: TuShareClient, as_of: Optional[date] = None) -> pd.DataFrame:
+    df = client.call_api("macro")  # fixture only
+    df["obs_date"] = pd.to_datetime(df["obs_date"])
+    if as_of is not None:
+        df = df[df["obs_date"] <= pd.Timestamp(as_of)]
+    cache_dataframe("macro_series", df)
     return df
 
 
-def fetch_index_weight(index_code: str, limit: int = 50) -> pd.DataFrame:
-    """Fetch top N constituents of an index from Tushare."""
-    pro = TushareClient(get_token()).pro()
-    latest = pro.index_weight(index_code=index_code, limit=1)
-    trade_date = latest['trade_date'].iloc[0] if not latest.empty else None
-    if not trade_date:
-        return pd.DataFrame()
-    df = pro.index_weight(index_code=index_code, trade_date=trade_date)
-    if df is None or df.empty:
-        return pd.DataFrame()
-    df = df.sort_values('weight', ascending=False)
-    if limit > 0:
-        df = df.head(limit)
-    return df
+def load_inputs(client: Optional[TuShareClient], ticker: str, as_of: date) -> ValidatedInputs:
+    client = client or TuShareClient()
+    fin = load_financials(client, ticker, as_of=as_of)
+    if fin.empty:
+        raise ValueError(f"No financial statements available for {ticker} on or before {as_of}")
+    latest = fin.iloc[-1]
+    previous = fin.iloc[-2] if len(fin) > 1 else latest
+    verification: Dict[str, str] = {}
+
+    def _ratio_status(metric: str, value: float, lo: float, hi: float, warn_pad: float = 0.2) -> None:
+        if pd.isna(value):
+            verification[metric] = "fail"
+            return
+        if lo <= value <= hi:
+            verification[metric] = "pass"
+        elif (lo - warn_pad) <= value <= (hi + warn_pad):
+            verification[metric] = "warn"
+        else:
+            verification[metric] = "fail"
+
+    def _diff_status(metric: str, value: float, pass_threshold: float, warn_threshold: float) -> None:
+        if pd.isna(value):
+            verification[metric] = "fail"
+            return
+        if value <= pass_threshold:
+            verification[metric] = "pass"
+        elif value <= warn_threshold:
+            verification[metric] = "warn"
+        else:
+            verification[metric] = "fail"
+
+    revenue = float(latest.get("revenue", 0.0))
+    net_profit = float(latest.get("net_profit", 0.0))
+    net_debt = float(latest.get("net_debt", 0.0))
+    operating_cf = float(latest.get("operating_cf", 0.0))
+    invested_capital = float(latest.get("invested_capital", 0.0))
+
+    cash_conversion = operating_cf / max(net_profit, 1e-6)
+    _ratio_status("cash_conversion", cash_conversion, 0.7, 1.3, warn_pad=0.6)
+
+    profit_margin = net_profit / max(revenue, 1.0)
+    _ratio_status("net_profit_margin", profit_margin, 0.05, 0.35, warn_pad=0.15)
+
+    if len(fin) > 1:
+        rev_growth = (latest.get("revenue", 0.0) - previous.get("revenue", 0.0)) / max(
+            previous.get("revenue", 1.0), 1.0
+        )
+        profit_growth = (latest.get("net_profit", 0.0) - previous.get("net_profit", 0.0)) / max(
+            previous.get("net_profit", 1.0), 1.0
+        )
+        growth_diff = abs(rev_growth - profit_growth)
+        _diff_status("growth_alignment", growth_diff, 0.05, 0.15)
+
+    debt_to_capital = net_debt / max(invested_capital, 1.0)
+    _ratio_status("net_debt_to_invested", debt_to_capital, 0.0, 1.0, warn_pad=0.5)
+
+    leverage_to_cash = net_debt / max(abs(operating_cf), 1.0)
+    _ratio_status("net_debt_vs_cf", leverage_to_cash, -2.5, 2.5, warn_pad=1.0)
+
+    passes = sum(1 for status in verification.values() if status == "pass")
+    warns = sum(1 for status in verification.values() if status == "warn")
+    fails = sum(1 for status in verification.values() if status == "fail")
+    total = max(len(verification), 1)
+    score = (passes + 0.5 * warns) / total
+    if fails == 0 and score >= 0.75:
+        grade = "A"
+    elif score >= 0.5:
+        grade = "B"
+    else:
+        grade = "C"
+
+    source_mode = client.last_call.get("mode", client.mode)
+    statement_end = latest.get("end_date")
+    if isinstance(statement_end, pd.Timestamp):
+        statement_end = statement_end.date().isoformat()
+    metadata = {
+        "source": "tushare" if source_mode == "live" else source_mode,
+        "source_mode": source_mode,
+        "statement_end_date": str(statement_end),
+        "statement_rows": str(len(fin)),
+        "verification_summary": f"pass:{passes}|warn:{warns}|fail:{fails}",
+        "last_endpoint": client.last_call.get("endpoint", "financials"),
+    }
+    if source_mode != "live":
+        metadata["fixture_dir"] = str(client.fixtures_dir)
+
+    return ValidatedInputs(
+        ticker=ticker,
+        as_of_date=as_of,
+        revenue=revenue,
+        net_profit=net_profit,
+        net_debt=net_debt,
+        operating_cf=operating_cf,
+        invested_capital=invested_capital,
+        verification=verification,
+        data_quality_grade=grade,
+        metadata=metadata,
+        statements=fin,
+    )
 
 
-def fetch_all_stock_basic() -> pd.DataFrame:
-    """Fetch all stock basic info for filtering."""
-    pro = TushareClient(get_token()).pro()
-    return pro.stock_basic(exchange='', list_status='L', fields='ts_code,name,industry,area,market')
+def _hash_params(endpoint: str, params: Dict) -> str:
+    raw = json.dumps({"endpoint": endpoint, "params": params}, sort_keys=True)
+    return hashlib.sha1(raw.encode()).hexdigest()[:10]
+
+
+__all__ = [
+    "TuShareClient",
+    "ValidatedInputs",
+    "ensure_duckdb_schema",
+    "cache_dataframe",
+    "load_financials",
+    "load_prices",
+    "load_macro_series",
+    "load_inputs",
+]

@@ -1,6 +1,9 @@
-streamlit
-pandas
-numpy
-plotly
-tushare
-pyyaml
+pandas>=2.0
+polars>=0.20
+numpy>=1.26
+tushare>=1.2.89
+duckdb>=1.0
+streamlit>=1.32
+plotly>=5.18
+yfinance>=0.2
+loguru>=0.7

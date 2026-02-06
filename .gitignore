@@ -1,6 +1,23 @@
-.venv/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Virtual env
+.venv/
+
+# Local app/runtime
+.codex/
+.streamlit/
+
+# OS
 .DS_Store
-.env
-/data/
+
+# Local database artifacts
+duckdb/*.duckdb
+duckdb/*.duckdb.*
+
+# Logs
+*.log
