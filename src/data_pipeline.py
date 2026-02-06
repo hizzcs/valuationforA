@@ -41,6 +41,14 @@ class ValidatedInputs:
     invested_capital: float
     verification: Dict[str, str]
     data_quality_grade: str
+    research_expense: float = 0.0
+    market_share: float = 0.0
+    technology_life_cycle: float = 0.0
+    capital_ratio: float = 0.0
+    npl_ratio: float = 0.0
+    net_interest_margin: float = 0.0
+    consumer_upgrade: float = 0.0
+    competition_intensity: float = 0.0
     metadata: Dict[str, str] = field(default_factory=dict)
     statements: pd.DataFrame = field(default_factory=pd.DataFrame)
 
