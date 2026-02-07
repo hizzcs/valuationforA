@@ -22,3 +22,18 @@ duckdb/*.duckdb.*
 
 # Logs
 *.log
+
+# Screenshots
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# Reports
+reports/
+*.pdf
+*.xlsx
+*.csv
+
+# Cache
+cache/
