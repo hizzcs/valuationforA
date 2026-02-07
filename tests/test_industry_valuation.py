@@ -3,6 +3,7 @@ import unittest
 from datetime import date
 from pathlib import Path
 from unittest.mock import patch
+import math
 
 import pandas as pd
 
@@ -56,6 +57,7 @@ class IndustryValuationTest(unittest.TestCase):
         industry_type = estimate_industry_type(self.ticker, validated)
         self.assertIsNotNone(industry_type)
         self.assertIsInstance(industry_type, IndustryType)
+        self.assertEqual(industry_type, IndustryType.FINANCIAL)
 
     def test_industry_valuation_basic(self) -> None:
         """Test basic industry valuation functionality."""
@@ -85,6 +87,8 @@ class IndustryValuationTest(unittest.TestCase):
         self.assertGreater(valuation_result.base_value, 0)
         self.assertIn("基础情景", valuation_result.scenarios)
         self.assertGreater(len(valuation_result.scenarios), 1)
+        self.assertIsNotNone(valuation_result.base_value_per_share)
+        self.assertIn("基础情景", valuation_result.scenarios_per_share)
 
     def test_financial_industry_valuation(self) -> None:
         """Test financial industry valuation."""
@@ -229,6 +233,9 @@ class IndustryValuationTest(unittest.TestCase):
 
             self.assertIsNotNone(valuation_result.sensitivity)
             self.assertIsNotNone(valuation_result.tornado)
+            for _, points in valuation_result.sensitivity.items():
+                self.assertTrue(all(math.isfinite(point[1]) for point in points))
+            self.assertTrue(all(math.isfinite(value) for value in valuation_result.tornado.values()))
 
     def test_fallback_mechanism(self) -> None:
         """Test fallback mechanism when industry-specific valuation fails."""
@@ -261,6 +268,7 @@ class IndustryValuationTest(unittest.TestCase):
                 self.assertIsInstance(valuation_result, IndustryValuationResult)
                 self.assertGreater(valuation_result.base_value, 0)
                 self.assertEqual(valuation_result.industry_type, "cyclical")
+                self.assertIsNotNone(valuation_result.base_value_per_share)
 
 
 if __name__ == "__main__":  # pragma: no cover

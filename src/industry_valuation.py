@@ -16,6 +16,12 @@ from .risk_params import RiskProfile
 from .valuation_core import revenue_driven_dcf, roic_driven_dcf, two_stage_dcf, ValuationResult
 from .scenario_engine import sensitivity_analysis, tornado_analysis, build_distribution_params, run_monte_carlo
 
+KNOWN_FINANCIAL_TICKERS = {
+    "600000.SH", "600015.SH", "600016.SH", "600036.SH", "601009.SH", "601166.SH",
+    "601169.SH", "601288.SH", "601328.SH", "601398.SH", "601658.SH", "601818.SH",
+    "601838.SH", "601939.SH", "601988.SH", "601998.SH", "000001.SZ",
+}
+
 
 class IndustryType(Enum):
     """Industry classification for A-share market."""
@@ -49,6 +55,8 @@ class IndustryValuationResult:
     industry_type: str
     base_value: float
     scenarios: Dict[str, float]
+    base_value_per_share: Optional[float] = None
+    scenarios_per_share: Optional[Dict[str, float]] = None
     sensitivity: Optional[Dict[str, List[float]]] = None
     tornado: Optional[Dict[str, float]] = None
     risk_factors: Optional[Dict[str, float]] = None
@@ -72,6 +80,20 @@ class IndustrySpecificParams:
     regulatory_caps: Optional[Dict[str, float]] = None
 
 
+def _to_per_share_value(enterprise_value: float, validated: ValidatedInputs) -> Optional[float]:
+    shares = max(validated.shares_outstanding, 0.0)
+    if shares <= 0:
+        return None
+    return float((enterprise_value - validated.net_debt) / shares)
+
+
+def _to_per_share_scenarios(scenarios: Dict[str, float], validated: ValidatedInputs) -> Optional[Dict[str, float]]:
+    shares = max(validated.shares_outstanding, 0.0)
+    if shares <= 0:
+        return None
+    return {name: float((value - validated.net_debt) / shares) for name, value in scenarios.items()}
+
+
 def estimate_industry_type(ticker: str, validated: ValidatedInputs) -> IndustryType:
     """
     Estimate industry type based on ticker and financial characteristics.
@@ -83,23 +105,33 @@ def estimate_industry_type(ticker: str, validated: ValidatedInputs) -> IndustryT
     Returns:
         IndustryType: Estimated industry type
     """
-    if any(term in str(validated.metadata.get("industry", "")).lower() for term in ["银行", "保险", "券商", "金融"]):
+    industry_hint = str(validated.metadata.get("industry", "")).lower()
+
+    if any(term in industry_hint for term in ["银行", "保险", "券商", "金融"]):
         return IndustryType.FINANCIAL
     
-    if any(term in str(validated.metadata.get("industry", "")).lower() for term in ["半导体", "软件", "科技", "电子"]):
+    if any(term in industry_hint for term in ["半导体", "软件", "科技", "电子"]):
         return IndustryType.TECH_GROWTH
     
-    if any(term in str(validated.metadata.get("industry", "")).lower() for term in ["钢铁", "煤炭", "有色", "化工"]):
+    if any(term in industry_hint for term in ["钢铁", "煤炭", "有色", "化工"]):
         return IndustryType.CYCLICAL
     
-    if any(term in str(validated.metadata.get("industry", "")).lower() for term in ["食品", "饮料", "家电", "医药", "消费"]):
+    if any(term in industry_hint for term in ["食品", "饮料", "家电", "医药", "消费"]):
         return IndustryType.CONSUMER
     
-    if any(term in str(validated.metadata.get("industry", "")).lower() for term in ["电力", "水务", "燃气", "公用"]):
+    if any(term in industry_hint for term in ["电力", "水务", "燃气", "公用"]):
         return IndustryType.UTILITIES
     
-    if any(term in str(validated.metadata.get("industry", "")).lower() for term in ["房地产", "地产"]):
+    if any(term in industry_hint for term in ["房地产", "地产"]):
         return IndustryType.REAL_ESTATE
+
+    ticker_upper = ticker.upper()
+    if ticker_upper in KNOWN_FINANCIAL_TICKERS:
+        return IndustryType.FINANCIAL
+
+    financial_columns = {"interest_income", "net_interest_income", "npl_ratio", "capital_ratio"}
+    if financial_columns.intersection(validated.statements.columns):
+        return IndustryType.FINANCIAL
     
     return IndustryType.OTHER
 
@@ -286,6 +318,8 @@ def cyclical_industry_valuation(
         "商品价格波动": np.std(commodity_prices["price"]),
         "需求增长率": validated.revenue / validated.statements["revenue"].iloc[0] - 1
     }
+    base_value_per_share = _to_per_share_value(scenarios["基础情景"], validated)
+    scenarios_per_share = _to_per_share_scenarios(scenarios, validated)
     
     return IndustryValuationResult(
         ticker=ticker,
@@ -293,6 +327,8 @@ def cyclical_industry_valuation(
         industry_type=IndustryType.CYCLICAL.value,
         base_value=scenarios["基础情景"],
         scenarios=scenarios,
+        base_value_per_share=base_value_per_share,
+        scenarios_per_share=scenarios_per_share,
         sensitivity=sensitivity,
         tornado=tornado,
         risk_factors=risk_factors,
@@ -392,6 +428,8 @@ def tech_growth_industry_valuation(
         "市场份额": validated.market_share if hasattr(validated, "market_share") else 0.0,
         "技术生命周期": validated.technology_life_cycle if hasattr(validated, "technology_life_cycle") else 0.0
     }
+    base_value_per_share = _to_per_share_value(scenarios["基础情景"], validated)
+    scenarios_per_share = _to_per_share_scenarios(scenarios, validated)
     
     return IndustryValuationResult(
         ticker=ticker,
@@ -399,6 +437,8 @@ def tech_growth_industry_valuation(
         industry_type=IndustryType.TECH_GROWTH.value,
         base_value=scenarios["基础情景"],
         scenarios=scenarios,
+        base_value_per_share=base_value_per_share,
+        scenarios_per_share=scenarios_per_share,
         sensitivity=sensitivity,
         tornado=tornado,
         risk_factors=risk_factors,
@@ -500,6 +540,8 @@ def financial_industry_valuation(
         "不良贷款率": validated.npl_ratio if hasattr(validated, "npl_ratio") else 0.0,
         "净息差": validated.net_interest_margin if hasattr(validated, "net_interest_margin") else 0.0
     }
+    base_value_per_share = _to_per_share_value(scenarios["基础情景"], validated)
+    scenarios_per_share = _to_per_share_scenarios(scenarios, validated)
     
     return IndustryValuationResult(
         ticker=ticker,
@@ -507,6 +549,8 @@ def financial_industry_valuation(
         industry_type=IndustryType.FINANCIAL.value,
         base_value=scenarios["基础情景"],
         scenarios=scenarios,
+        base_value_per_share=base_value_per_share,
+        scenarios_per_share=scenarios_per_share,
         sensitivity=sensitivity,
         tornado=tornado,
         risk_factors=risk_factors,
@@ -608,6 +652,8 @@ def consumer_industry_valuation(
         "通货膨胀": macro_data["cpi"].iloc[-1] if "cpi" in macro_data.columns else 0.025,
         "竞争强度": validated.competition_intensity if hasattr(validated, "competition_intensity") else 0.0
     }
+    base_value_per_share = _to_per_share_value(scenarios["基础情景"], validated)
+    scenarios_per_share = _to_per_share_scenarios(scenarios, validated)
     
     return IndustryValuationResult(
         ticker=ticker,
@@ -615,6 +661,8 @@ def consumer_industry_valuation(
         industry_type=IndustryType.CONSUMER.value,
         base_value=scenarios["基础情景"],
         scenarios=scenarios,
+        base_value_per_share=base_value_per_share,
+        scenarios_per_share=scenarios_per_share,
         sensitivity=sensitivity,
         tornado=tornado,
         risk_factors=risk_factors,
@@ -717,12 +765,16 @@ def estimate_industry_valuation(
                 "乐观情景": base_result.intrinsic_value * 1.3,
                 "悲观情景": base_result.intrinsic_value * 0.8
             }
+            base_value_per_share = _to_per_share_value(scenarios["基础情景"], validated)
+            scenarios_per_share = _to_per_share_scenarios(scenarios, validated)
             return IndustryValuationResult(
                 ticker=ticker,
                 as_of_date=as_of_date,
                 industry_type=industry_type.value,
                 base_value=scenarios["基础情景"],
                 scenarios=scenarios,
+                base_value_per_share=base_value_per_share,
+                scenarios_per_share=scenarios_per_share,
                 assumptions=base_result.assumptions,
                 metadata=base_result.metadata
             )
@@ -735,12 +787,16 @@ def estimate_industry_valuation(
             "乐观情景": base_result.intrinsic_value * 1.3,
             "悲观情景": base_result.intrinsic_value * 0.8
         }
+        base_value_per_share = _to_per_share_value(scenarios["基础情景"], validated)
+        scenarios_per_share = _to_per_share_scenarios(scenarios, validated)
         return IndustryValuationResult(
             ticker=ticker,
             as_of_date=as_of_date,
             industry_type=industry_type.value,
             base_value=scenarios["基础情景"],
             scenarios=scenarios,
+            base_value_per_share=base_value_per_share,
+            scenarios_per_share=scenarios_per_share,
             assumptions=base_result.assumptions,
             metadata=base_result.metadata
         )

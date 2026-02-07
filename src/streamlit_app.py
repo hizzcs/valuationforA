@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 import sys
 
@@ -24,7 +24,7 @@ from src.risk_params import build_risk_profile  # noqa: E402
 from src.scenario_engine import build_distribution_params, run_monte_carlo, tornado_analysis  # noqa: E402
 from src.reporting import log_risk_profile, save_valuation  # noqa: E402
 from src.valuation_core import revenue_driven_dcf, roic_driven_dcf, two_stage_dcf  # noqa: E402
-from src.industry_valuation import estimate_industry_type, estimate_industry_valuation, IndustryType, IndustryValuationResult  # noqa: E402
+from src.industry_valuation import estimate_industry_type, estimate_industry_valuation  # noqa: E402
 from src.alerts import evaluate_alerts, persist_alerts  # noqa: E402
 
 
@@ -42,9 +42,13 @@ def render_badge(status: str) -> str:
     return "❌"
 
 
-def render_scenarios_table(scenarios: dict):
-    df = pd.DataFrame(list(scenarios.items()), columns=['情景', '内在价值'])
-    df['内在价值'] = df['内在价值'].apply(lambda x: f"{x:,.0f}")
+def render_scenarios_table(scenarios: dict, scenarios_per_share: dict | None = None):
+    df = pd.DataFrame(list(scenarios.items()), columns=['情景', '企业价值(总额)'])
+    if scenarios_per_share:
+        df['每股内在价值'] = df['情景'].map(scenarios_per_share)
+    df['企业价值(总额)'] = df['企业价值(总额)'].apply(lambda x: f"{x:,.0f}")
+    if '每股内在价值' in df.columns:
+        df['每股内在价值'] = df['每股内在价值'].apply(lambda x: f"{x:,.2f}" if pd.notna(x) else "N/A")
     return df
 
 def render_tornado_chart(tornado: dict):
@@ -102,6 +106,104 @@ def render_cash_flow_chart(cash_flows, discount_factors):
     
     return fig
 
+
+def render_weekly_kline(prices: pd.DataFrame):
+    if prices.empty:
+        return None
+    recent = prices.sort_values("trade_date").tail(7).copy()
+    required_cols = {"open", "high", "low", "close"}
+    if not required_cols.issubset(set(recent.columns)):
+        recent["open"] = recent["close"].shift(1).fillna(recent["close"])
+        recent["high"] = recent[["open", "close"]].max(axis=1)
+        recent["low"] = recent[["open", "close"]].min(axis=1)
+
+    fig = go.Figure(
+        data=[
+            go.Candlestick(
+                x=recent["trade_date"],
+                open=recent["open"],
+                high=recent["high"],
+                low=recent["low"],
+                close=recent["close"],
+                increasing_line_color="#d32f2f",
+                decreasing_line_color="#2e7d32",
+                name="K线",
+            )
+        ]
+    )
+    fig.update_layout(
+        title="近1周K线（最新可得交易日）",
+        xaxis_title="交易日",
+        yaxis_title="价格",
+        xaxis_rangeslider_visible=False,
+        height=420,
+    )
+    return fig
+
+
+def render_method_guide() -> None:
+    st.subheader("方法说明与适用场景")
+    st.caption("以下说明用于解释模型输入与输出，系统按确定性公式计算，不使用黑箱预测。")
+
+    with st.expander("收入驱动 DCF（Revenue-driven FCFF）", expanded=False):
+        st.markdown(
+            r"""
+            **核心公式**
+            - \(Revenue_t = Revenue_{t-1}\times(1+g_t)\)
+            - \(NOPAT_t = Revenue_t \times Operating\ Margin\)
+            - \(FCFF_t = NOPAT_t - Reinvestment_t\)
+            - \(EV = \sum_{t=1}^{n}\frac{FCFF_t}{(1+WACC)^t} + \frac{TV}{(1+WACC)^n}\)
+            - \(TV_{perpetual}=\frac{FCFF_n(1+g)}{WACC-g}\)
+            - \(Equity\ Value\ Per\ Share = \frac{EV - Net\ Debt}{Shares}\)
+
+            **适用场景**
+            - 收入和利润率相对可预测的成熟行业（消费、制造、公用事业等）。
+            - 管理层提供了中短期收入目标，便于逐年拆解。
+            """
+        )
+
+    with st.expander("ROIC 驱动 DCF", expanded=False):
+        st.markdown(
+            r"""
+            **核心逻辑**
+            - 先预测投入资本 \(Invested\ Capital_t\) 与回报率 \(ROIC_t\)。
+            - \(NOPAT_t = Invested\ Capital_t \times ROIC_t\)
+            - 再由 \(FCFF_t = NOPAT_t - Reinvestment_t\) 折现得到企业价值。
+
+            **适用场景**
+            - 资本开支和周转是核心驱动（重资产、周期行业）。
+            - 希望把“增长质量（ROIC-WACC）”单独拉出来评估时。
+            """
+        )
+
+    with st.expander("两阶段 DCF", expanded=False):
+        st.markdown(
+            r"""
+            **核心逻辑**
+            - 高增长阶段：使用较高增长率；
+            - 稳定阶段：向长期稳态增长率收敛；
+            - 对两阶段现金流与终值统一折现。
+
+            **适用场景**
+            - 公司处于“高增速向稳态过渡”区间（科技成长、行业拐点）。
+            """
+        )
+
+    with st.expander("行业特定估值", expanded=False):
+        st.markdown(
+            """
+            **核心逻辑**
+            - 先识别行业属性（金融/消费/周期/科技等）；
+            - 对 β、WACC、增长阶段与情景参数做行业化修正；
+            - 输出基础情景、乐观/悲观情景与敏感性分析。
+
+            **适用场景**
+            - 单一通用参数难以刻画行业差异时（如金融监管、周期波动、研发驱动）。
+            """
+        )
+
+    st.caption("参考资料：Damodaran《Investment Valuation》、Koller等《Valuation: Measuring and Managing the Value of Companies》、Brealey等《Principles of Corporate Finance》。")
+
 def main() -> None:
     sidebar = st.sidebar
     ticker = sidebar.text_input("TuShare TS 代码", value="600000.SH")
@@ -123,6 +225,7 @@ def main() -> None:
     with st.spinner("加载数据..."):
         validated = load_inputs(client, ticker, as_of)
         prices = load_prices(client, ticker, as_of=as_of)
+        market_prices = load_prices(client, ticker, as_of=None)
         csi300 = client.call_api("csi300")
         csi300["trade_date"] = pd.to_datetime(csi300["trade_date"])
         csi300 = csi300[csi300["trade_date"] <= pd.Timestamp(as_of)]
@@ -141,6 +244,8 @@ def main() -> None:
                 ticker, as_of, validated, risk
             )
             st.session_state['industry_val'] = industry_val_result
+        else:
+            st.session_state.pop('industry_val', None)
         
         # 基础估值
         base_result = revenue_driven_dcf(validated, risk)
@@ -155,11 +260,12 @@ def main() -> None:
                                   ["revenue_growth", "operating_margin", "wacc"])
 
     st.subheader("数据校验")
-    grade_col, source_col, industry_col = st.columns(3)
+    grade_col, source_col, industry_col, shares_col = st.columns(4)
     grade_col.metric("数据质量", validated.data_quality_grade)
     source_col.metric("数据模式", validated.metadata.get("source_mode", "fixture"))
     industry_type = estimate_industry_type(ticker, validated)
     industry_col.metric("行业类型", industry_type.value)
+    shares_col.metric("总股本(股)", f"{validated.shares_outstanding:,.0f}" if validated.shares_outstanding > 0 else "N/A")
     
     cols = st.columns(max(len(validated.verification), 1))
     for idx, (metric, status) in enumerate(validated.verification.items()):
@@ -168,14 +274,36 @@ def main() -> None:
     st.subheader("风险画像")
     st.json(risk.trace)
 
+    st.subheader("市场价格")
+    if market_prices.empty:
+        st.warning("无可用价格数据，无法展示K线。")
+    else:
+        latest_row = market_prices.sort_values("trade_date").iloc[-1]
+        latest_price = float(latest_row["close"])
+        latest_date = pd.Timestamp(latest_row["trade_date"]).date()
+        today = datetime.now().date()
+        if latest_date == today:
+            st.metric("当日最新价", f"{latest_price:,.2f}")
+        else:
+            st.metric(f"最近收盘价（{latest_date.isoformat()}）", f"{latest_price:,.2f}")
+
+        kline_fig = render_weekly_kline(market_prices)
+        if kline_fig:
+            st.plotly_chart(kline_fig)
+
     st.subheader("估值结果")
     if 'industry_val' in st.session_state:
         industry_val = st.session_state['industry_val']
         st.markdown("### 🎯 行业特定估值")
         st.write(f"内在价值: {industry_val.base_value:,.0f}")
+        st.write(
+            f"每股内在价值: {industry_val.base_value_per_share:,.2f}"
+            if industry_val.base_value_per_share is not None
+            else "每股内在价值: N/A（缺少可靠总股本）"
+        )
         
         st.markdown("#### 情景分析")
-        st.table(render_scenarios_table(industry_val.scenarios))
+        st.table(render_scenarios_table(industry_val.scenarios, industry_val.scenarios_per_share))
         
         if industry_val.tornado:
             st.markdown("#### 参数影响敏感性分析")
@@ -189,9 +317,24 @@ def main() -> None:
                 st.plotly_chart(fig)
     else:
         col1, col2, col3 = st.columns(3)
-        col1.metric("收入驱动DCF", f"{base_result.intrinsic_value:,.0f}")
-        col2.metric("ROIC驱动DCF", f"{roic_result.intrinsic_value:,.0f}")
-        col3.metric("两阶段DCF", f"{two_stage_result.intrinsic_value:,.0f}")
+        col1.metric(
+            "收入驱动DCF（每股）",
+            f"{base_result.intrinsic_value_per_share:,.2f}" if base_result.intrinsic_value_per_share is not None else "N/A",
+            help="公式：每股内在价值=(企业价值-净负债)/总股本",
+        )
+        col2.metric(
+            "ROIC驱动DCF（每股）",
+            f"{roic_result.intrinsic_value_per_share:,.2f}" if roic_result.intrinsic_value_per_share is not None else "N/A",
+            help="公式：每股内在价值=(企业价值-净负债)/总股本",
+        )
+        col3.metric(
+            "两阶段DCF（每股）",
+            f"{two_stage_result.intrinsic_value_per_share:,.2f}" if two_stage_result.intrinsic_value_per_share is not None else "N/A",
+            help="公式：每股内在价值=(企业价值-净负债)/总股本",
+        )
+        st.caption(
+            f"企业价值（总额）：收入驱动 {base_result.intrinsic_value:,.0f}，ROIC驱动 {roic_result.intrinsic_value:,.0f}，两阶段 {two_stage_result.intrinsic_value:,.0f}"
+        )
         
         st.markdown("#### 自由现金流分析 (收入驱动)")
         st.plotly_chart(render_cash_flow_chart(base_result.cash_flows, base_result.discount_factors))
@@ -214,6 +357,9 @@ def main() -> None:
 
     st.subheader("参数敏感性分析")
     st.plotly_chart(render_tornado_chart(tornado))
+    st.caption("龙卷风图展示“单一参数变化”对估值的边际影响，适合识别最敏感输入。")
+
+    render_method_guide()
 
     st.subheader("数据来源透明度")
     st.table(

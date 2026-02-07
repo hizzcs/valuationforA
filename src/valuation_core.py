@@ -25,6 +25,8 @@ class ValuationResult:
     terminal_value: float
     assumptions: Dict[str, float]
     metadata: Dict[str, str]
+    equity_value: float = 0.0
+    intrinsic_value_per_share: Optional[float] = None
     terminal_method: str = "perpetual"
     terminal_exit_multiple: Optional[float] = None
 
@@ -147,6 +149,14 @@ def _valuation_metadata(validated: ValidatedInputs) -> Dict[str, str]:
     return metadata
 
 
+def _equity_value_per_share(enterprise_value: float, validated: ValidatedInputs) -> tuple[float, Optional[float]]:
+    equity_value = enterprise_value - validated.net_debt
+    shares = max(validated.shares_outstanding, 0.0)
+    if shares <= 0:
+        return float(equity_value), None
+    return float(equity_value), float(equity_value / shares)
+
+
 def _discount_factors(rate: float, periods: int) -> List[float]:
     return [1 / ((1 + rate) ** t) for t in range(1, periods + 1)]
 
@@ -194,6 +204,7 @@ def revenue_driven_dcf(
     )
     pv_terminal = terminal_value / ((1 + discount_rate) ** horizon)
     intrinsic = pv_flows + pv_terminal
+    equity_value, intrinsic_value_per_share = _equity_value_per_share(intrinsic, validated)
     assumptions = {
         "revenue_growth": revenue_growth,
         "operating_margin": operating_margin,
@@ -210,6 +221,8 @@ def revenue_driven_dcf(
         as_of_date=validated.as_of_date,
         method="revenue",
         intrinsic_value=intrinsic,
+        equity_value=equity_value,
+        intrinsic_value_per_share=intrinsic_value_per_share,
         cash_flows=cash_flows,
         discount_factors=discount,
         terminal_value=terminal_value,
@@ -257,6 +270,7 @@ def roic_driven_dcf(
     )
     pv_terminal = terminal_value / ((1 + discount_rate) ** horizon)
     intrinsic = pv_flows + pv_terminal
+    equity_value, intrinsic_value_per_share = _equity_value_per_share(intrinsic, validated)
     assumptions = {
         "roic": roic,
         "reinvestment_rate": reinvestment_rate,
@@ -271,6 +285,8 @@ def roic_driven_dcf(
         as_of_date=validated.as_of_date,
         method="roic",
         intrinsic_value=intrinsic,
+        equity_value=equity_value,
+        intrinsic_value_per_share=intrinsic_value_per_share,
         cash_flows=cash_flows,
         discount_factors=discount,
         terminal_value=terminal_value,
@@ -333,6 +349,7 @@ def two_stage_dcf(
     )
     pv_terminal = terminal_value / ((1 + discount_rate) ** horizon)
     intrinsic = pv_flows + pv_terminal
+    equity_value, intrinsic_value_per_share = _equity_value_per_share(intrinsic, validated)
     assumptions = {
         "high_growth_rate": high_growth_rate,
         "stable_growth_rate": stable_growth_rate,
@@ -350,6 +367,8 @@ def two_stage_dcf(
         as_of_date=validated.as_of_date,
         method="two_stage",
         intrinsic_value=intrinsic,
+        equity_value=equity_value,
+        intrinsic_value_per_share=intrinsic_value_per_share,
         cash_flows=cash_flows,
         discount_factors=discount,
         terminal_value=terminal_value,

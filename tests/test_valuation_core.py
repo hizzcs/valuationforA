@@ -29,6 +29,9 @@ class ValuationCoreTest(unittest.TestCase):
         risk = build_risk_profile(self.ticker, self.as_of, prices, csi300, bonds, validated.statements)
         valuation = revenue_driven_dcf(validated, risk)
         self.assertGreater(valuation.intrinsic_value, 0)
+        self.assertGreater(validated.shares_outstanding, 0)
+        self.assertIsNotNone(valuation.intrinsic_value_per_share)
+        self.assertGreater(valuation.intrinsic_value_per_share, 0)
         self.assertEqual(valuation.method, "revenue")
         self.assertIn("operating_margin", valuation.assumptions)
         self.assertIn("fade_years", valuation.assumptions)
@@ -48,6 +51,8 @@ class ValuationCoreTest(unittest.TestCase):
         valuation = roic_driven_dcf(validated, risk)
         self.assertAlmostEqual(len(valuation.cash_flows), 5)
         self.assertTrue(math.isfinite(valuation.terminal_value))
+        self.assertIsNotNone(valuation.intrinsic_value_per_share)
+        self.assertTrue(math.isfinite(valuation.intrinsic_value_per_share))
         self.assertIn("fade_years", valuation.assumptions)
         self.assertGreaterEqual(valuation.assumptions["fade_years"], 3)
 
@@ -63,6 +68,8 @@ class ValuationCoreTest(unittest.TestCase):
         risk = build_risk_profile(self.ticker, self.as_of, prices, csi300, bonds, validated.statements)
         valuation = two_stage_dcf(validated, risk)
         self.assertGreater(valuation.intrinsic_value, 0)
+        self.assertIsNotNone(valuation.intrinsic_value_per_share)
+        self.assertGreater(valuation.intrinsic_value_per_share, 0)
         self.assertEqual(valuation.method, "two_stage")
         self.assertTrue(math.isfinite(valuation.terminal_value))
 

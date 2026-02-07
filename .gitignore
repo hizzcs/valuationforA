@@ -12,6 +12,7 @@ venv/
 # Local app/runtime
 .codex/
 .streamlit/
+.env
 
 # OS
 .DS_Store
@@ -24,16 +25,10 @@ duckdb/*.duckdb.*
 *.log
 
 # Screenshots
-*.png
-*.jpg
-*.jpeg
-*.gif
+screenshots/
 
 # Reports
 reports/
-*.pdf
-*.xlsx
-*.csv
 
 # Cache
 cache/

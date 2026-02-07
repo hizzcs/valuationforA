@@ -12,6 +12,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
+from typing import Optional, TextIO, Tuple
 
 def check_system_requirements():
     """检查系统要求"""
@@ -70,14 +71,18 @@ def check_env_variables():
             if env_file.exists():
                 with open(env_file, 'r') as f:
                     for line in f:
-                        if line.strip() and not line.startswith('#'):
-                            key, value = line.strip().split('=', 1)
-                            if key == var:
-                                os.environ[key] = value.strip()
-                                break
+                        content = line.strip()
+                        if not content or content.startswith('#') or '=' not in content:
+                            continue
+                        key, value = content.split('=', 1)
+                        if key == var:
+                            os.environ[key] = value.strip().strip('"')
+                            break
+                if var not in os.environ or not os.environ[var]:
+                    missing_vars.append(var)
             else:
                 missing_vars.append(var)
-        else:
+        if var in os.environ:
             # 验证token格式
             if var == "TUSHARE_TOKEN" and len(os.environ[var]) < 10:
                 print("❌ TUSHARE_TOKEN格式不正确")
@@ -91,7 +96,8 @@ def check_env_variables():
     print("✅ 环境变量检查通过")
     return True
 
-def start_streamlit_server():
+
+def start_streamlit_server() -> Optional[Tuple[subprocess.Popen, TextIO]]:
     """启动Streamlit服务器"""
     print("🚀 启动Streamlit服务器...")
     
@@ -105,10 +111,14 @@ def start_streamlit_server():
     ]
     
     try:
+        log_dir = Path("logs")
+        log_dir.mkdir(exist_ok=True)
+        log_file = open(log_dir / "streamlit_production.log", "a", encoding="utf-8")
+
         process = subprocess.Popen(
             streamlit_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=log_file,
+            stderr=log_file,
             text=True
         )
         
@@ -117,19 +127,20 @@ def start_streamlit_server():
         
         # 检查是否正常运行
         if process.poll() is not None:
-            stderr = process.stderr.read()
-            print(f"❌ Streamlit服务器启动失败: {stderr}")
-            return False
+            print("❌ Streamlit服务器启动失败，请检查 logs/streamlit_production.log")
+            log_file.close()
+            return None
         
         print("✅ Streamlit服务器启动成功")
         print("📡 服务地址: http://localhost:8502")
         print("🔗 外部访问: http://0.0.0.0:8502")
+        print("📝 日志文件: logs/streamlit_production.log")
         
-        return True
+        return process, log_file
         
     except Exception as e:
         print(f"❌ 启动服务器时出错: {e}")
-        return False
+        return None
 
 def create_production_config():
     """创建生产环境配置"""
@@ -211,7 +222,9 @@ def main():
     print("\n✅ 所有检查通过，开始启动服务")
     print("=" * 50)
     
-    if start_streamlit_server():
+    streamlit_server = start_streamlit_server()
+    if streamlit_server:
+        process, log_handle = streamlit_server
         print("\n🎉 系统启动成功！")
         print("\n📋 生产环境说明:")
         print("- 所有接口访问受限")
@@ -223,8 +236,18 @@ def main():
             # 等待用户中断
             while True:
                 time.sleep(10)
+                if process.poll() is not None:
+                    print("\n❌ Streamlit进程已退出，请检查 logs/streamlit_production.log")
+                    log_handle.close()
+                    return False
         except KeyboardInterrupt:
             print("\n⏹️  正在关闭服务器...")
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            log_handle.close()
             return True
     else:
         print("\n❌ 服务启动失败")

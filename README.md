@@ -15,12 +15,23 @@
 ## 快速开始
 
 1. 安装依赖：`python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt`
-2. 可选设置 TuShare Token：`export TUSHARE_TOKEN=你的token`
+2. 可选设置 TuShare Token（启动前注入）：
+   - 方式A（推荐，持久）：写入项目根目录 `.env`：`TUSHARE_TOKEN=你的token`
+   - 方式B（当前终端会话）：`export TUSHARE_TOKEN=你的token`
 3. 运行环境检查：`./.venv/bin/python scripts/check_env.py`（验证 Token、TuShare 端点与 DuckDB 表结构）
 4. 执行测试：`./.venv/bin/python -m unittest discover -s tests -p 'test_*.py'`
 5. 启动前端：`./.venv/bin/streamlit run src/streamlit_app.py`
 
 即使缺少 Token，也会自动落到 `tests/data/*.csv` 的离线样本；Streamlit UI 会显示“fixture mode” 徽章提醒数据来源。
+
+## 常见问题
+
+- 启动后没有自动打开浏览器：
+  - 手动访问 [http://localhost:8501](http://localhost:8501)。
+  - 如端口占用可改端口：`./.venv/bin/streamlit run src/streamlit_app.py --server.port 8502`
+- 首次启动很慢：
+  - Python 3.13 下首次导入 `streamlit/plotly` 可能需要较长时间（会生成缓存），请先等待 1-2 分钟，不要立刻 `Ctrl+C`。
+  - 二次启动通常会明显变快。
 
 ## DuckDB 表设计
 

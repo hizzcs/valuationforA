@@ -16,18 +16,56 @@ except Exception:  # pragma: no cover - duckdb optional for tests
 import pandas as pd
 from loguru import logger
 
-try:  # Optional TuShare import for environments with the package installed
-    import tushare as ts
-except Exception:  # pragma: no cover - offline environments
-    ts = None  # type: ignore
-
-try:  # Optional yfinance fallback for CSI300
-    import yfinance as yf
-except Exception:  # pragma: no cover
-    yf = None  # type: ignore
+ts = None  # lazy-loaded in _get_tushare()
+yf = None  # lazy-loaded in _get_yfinance()
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_DIR = REPO_ROOT / "tests" / "data"
 DUCKDB_PATH = REPO_ROOT / "duckdb" / "valuation.duckdb"
+ENV_PATH = REPO_ROOT / ".env"
+
+
+def _load_env_token(key: str = "TUSHARE_TOKEN", env_path: Path = ENV_PATH) -> Optional[str]:
+    """Lightweight .env reader to avoid requiring python-dotenv."""
+    if not env_path.exists():
+        return None
+    try:
+        for raw in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            if k.strip() != key:
+                continue
+            token = v.strip().strip('"').strip("'")
+            if token:
+                return token
+    except Exception:
+        return None
+    return None
+
+
+def _get_tushare():
+    global ts
+    if ts is not None:
+        return ts
+    try:  # Optional TuShare import for environments with the package installed
+        import tushare as _ts
+        ts = _ts
+    except Exception:  # pragma: no cover - offline environments
+        ts = False  # type: ignore[assignment]
+    return None if ts is False else ts
+
+
+def _get_yfinance():
+    global yf
+    if yf is not None:
+        return yf
+    try:  # Optional yfinance fallback for CSI300
+        import yfinance as _yf
+        yf = _yf
+    except Exception:  # pragma: no cover
+        yf = False  # type: ignore[assignment]
+    return None if yf is False else yf
 
 
 @dataclass
@@ -39,6 +77,7 @@ class ValidatedInputs:
     net_debt: float
     operating_cf: float
     invested_capital: float
+    shares_outstanding: float
     verification: Dict[str, str]
     data_quality_grade: str
     research_expense: float = 0.0
@@ -57,13 +96,22 @@ class TuShareClient:
     """Wrapper around TuShare that logs every call and falls back to fixtures."""
 
     def __init__(self, token: Optional[str] = None, fixtures_dir: Path = FIXTURE_DIR):
-        self.token = token or os.getenv("TUSHARE_TOKEN")
+        if token is not None:
+            resolved_token = token.strip() or None
+        else:
+            env_token = os.getenv("TUSHARE_TOKEN")
+            if env_token is not None:  # Explicitly set (including empty) should take precedence over .env.
+                resolved_token = env_token.strip() or None
+            else:
+                resolved_token = _load_env_token()
+        self.token = resolved_token
         self.fixtures_dir = fixtures_dir
         self._pro = None
         self.last_call: Dict[str, str] = {}
-        if self.token and ts is not None:
+        ts_module = _get_tushare() if self.token else None
+        if self.token and ts_module is not None:
             try:
-                self._pro = ts.pro_api(self.token)
+                self._pro = ts_module.pro_api(self.token)
                 logger.info("Initialized TuShare client with provided token.")
             except Exception as exc:  # pragma: no cover - runtime failure path
                 logger.warning("Failed to init TuShare, falling back to fixtures: {}", exc)
@@ -100,9 +148,10 @@ class TuShareClient:
                 logger.error("TuShare call failed ({}): {} -- falling back to fixtures", endpoint, exc)
         fixture_path = self.fixtures_dir / f"{endpoint}.csv"
         if not fixture_path.exists():
-            if endpoint == "csi300" and yf is not None:
+            yf_module = _get_yfinance()
+            if endpoint == "csi300" and yf_module is not None:
                 logger.warning("Fixture missing for CSI300, downloading via yfinance fallback.")
-                data = yf.download("000300.SS", period="1y", progress=False)
+                data = yf_module.download("000300.SS", period="1y", progress=False)
                 df = (
                     data.reset_index()
                     .rename(columns={"Date": "trade_date", "Close": "close"})[["trade_date", "close"]]
@@ -319,7 +368,7 @@ def load_financials(client: TuShareClient, ticker: str, as_of: Optional[date] = 
     for col in ["revenue", "net_profit", "net_debt", "operating_cf", "invested_capital"]:
         if col in df:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-    for col in ["interest_expense", "total_debt"]:
+    for col in ["interest_expense", "total_debt", "shares_outstanding", "total_share", "total_shares", "share_total"]:
         if col in df:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     cache_dataframe("raw_financials", df)
@@ -376,11 +425,50 @@ def load_inputs(client: Optional[TuShareClient], ticker: str, as_of: date) -> Va
         else:
             verification[metric] = "fail"
 
-    revenue = float(latest.get("revenue", 0.0))
-    net_profit = float(latest.get("net_profit", 0.0))
-    net_debt = float(latest.get("net_debt", 0.0))
-    operating_cf = float(latest.get("operating_cf", 0.0))
-    invested_capital = float(latest.get("invested_capital", 0.0))
+    def _safe_float(row: pd.Series, key: str, default: float = 0.0) -> float:
+        value = pd.to_numeric(row.get(key, default), errors="coerce")
+        if pd.isna(value):
+            return default
+        return float(value)
+
+    def _normalize_shares(raw: float) -> float:
+        # TuShare's `total_share` is often reported in 10k-share units.
+        # If the value is suspiciously small, scale it to shares.
+        if raw <= 0:
+            return 0.0
+        return raw * 10000 if raw < 1e8 else raw
+
+    def _extract_shares(financials: pd.DataFrame) -> float:
+        latest_row = financials.iloc[-1]
+        for col in ("shares_outstanding", "total_shares", "share_total", "total_share"):
+            value = _safe_float(latest_row, col, default=0.0)
+            if value > 0:
+                return _normalize_shares(value)
+
+        # Fallback to daily_basic when financial statements don't carry share count.
+        try:
+            daily_basic = client.call_api("daily_basic", ts_code=ticker)
+            if not daily_basic.empty:
+                basic = daily_basic.copy()
+                if "trade_date" in basic.columns:
+                    basic["trade_date"] = pd.to_datetime(basic["trade_date"])
+                    basic = basic[basic["trade_date"] <= pd.Timestamp(as_of)]
+                if not basic.empty:
+                    latest_basic = basic.sort_values("trade_date").iloc[-1] if "trade_date" in basic.columns else basic.iloc[-1]
+                    value = _safe_float(latest_basic, "total_share", default=0.0)
+                    if value > 0:
+                        return _normalize_shares(value)
+        except (FileNotFoundError, AttributeError, KeyError):
+            pass
+        return 0.0
+
+    revenue = _safe_float(latest, "revenue")
+    net_profit = _safe_float(latest, "net_profit")
+    net_debt = _safe_float(latest, "net_debt")
+    operating_cf = _safe_float(latest, "operating_cf")
+    invested_capital = _safe_float(latest, "invested_capital")
+    shares_outstanding = _extract_shares(fin)
+    industry = str(latest.get("industry", latest.get("industry_name", ""))).strip()
 
     cash_conversion = operating_cf / max(net_profit, 1e-6)
     _ratio_status("cash_conversion", cash_conversion, 0.7, 1.3, warn_pad=0.6)
@@ -427,9 +515,20 @@ def load_inputs(client: Optional[TuShareClient], ticker: str, as_of: date) -> Va
         "statement_rows": str(len(fin)),
         "verification_summary": f"pass:{passes}|warn:{warns}|fail:{fails}",
         "last_endpoint": client.last_call.get("endpoint", "financials"),
+        "industry": industry,
+        "shares_outstanding": str(shares_outstanding),
     }
     if source_mode != "live":
         metadata["fixture_dir"] = str(client.fixtures_dir)
+    if not industry:
+        try:
+            basic = client.call_api("stock_basic", ts_code=ticker)
+            if not basic.empty:
+                metadata["industry"] = str(
+                    basic.iloc[0].get("industry", basic.iloc[0].get("industry_name", ""))
+                ).strip()
+        except (FileNotFoundError, AttributeError, KeyError):
+            pass
 
     return ValidatedInputs(
         ticker=ticker,
@@ -439,8 +538,17 @@ def load_inputs(client: Optional[TuShareClient], ticker: str, as_of: date) -> Va
         net_debt=net_debt,
         operating_cf=operating_cf,
         invested_capital=invested_capital,
+        shares_outstanding=shares_outstanding,
         verification=verification,
         data_quality_grade=grade,
+        research_expense=_safe_float(latest, "research_expense"),
+        market_share=_safe_float(latest, "market_share"),
+        technology_life_cycle=_safe_float(latest, "technology_life_cycle"),
+        capital_ratio=_safe_float(latest, "capital_ratio"),
+        npl_ratio=_safe_float(latest, "npl_ratio"),
+        net_interest_margin=_safe_float(latest, "net_interest_margin"),
+        consumer_upgrade=_safe_float(latest, "consumer_upgrade"),
+        competition_intensity=_safe_float(latest, "competition_intensity"),
         metadata=metadata,
         statements=fin,
     )

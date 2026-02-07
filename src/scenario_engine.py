@@ -1,7 +1,8 @@
 """Scenario generation and Monte Carlo simulation utilities."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import inspect
 from typing import Dict, List, Optional, Callable
 
 import numpy as np
@@ -93,6 +94,11 @@ def run_monte_carlo(
     if valid_samples < draws * 0.5:
         logger.warning(f"Only {valid_samples} valid samples out of {draws}; consider adjusting distribution parameters")
 
+    if not samples:
+        logger.warning("Monte Carlo produced no valid samples; falling back to base intrinsic value.")
+        fallback = float(base_result.intrinsic_value)
+        samples = [fallback]
+
     percentile_5 = float(np.percentile(samples, 5))
     percentile_50 = float(np.percentile(samples, 50))
     percentile_95 = float(np.percentile(samples, 95))
@@ -112,7 +118,7 @@ def sensitivity_analysis(
     base_result: ValuationResult,
     validated: ValidatedInputs,
     risk: RiskProfile,
-    valuation_func: Callable[[ValidatedInputs, RiskProfile, Dict[str, float]], ValuationResult],
+    valuation_func: Callable[..., ValuationResult],
     parameters: List[str],
     ranges: List[List[float]],
     num_points: int = 5,
@@ -133,7 +139,13 @@ def sensitivity_analysis(
         Dict[str, List[float]]: Sensitivity results
     """
     sensitivity_results = {}
-    base_value = base_result.intrinsic_value
+    sig = inspect.signature(valuation_func)
+    allowed_kwargs = {
+        name
+        for name, param in sig.parameters.items()
+        if name not in {"validated", "risk"}
+        and param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
 
     for param, param_range in zip(parameters, ranges):
         values = np.linspace(param_range[0], param_range[1], num_points)
@@ -142,7 +154,11 @@ def sensitivity_analysis(
             try:
                 modified_assumptions = base_result.assumptions.copy()
                 modified_assumptions[param] = float(val)
-                result = valuation_func(validated, risk, **modified_assumptions)
+                call_kwargs = {
+                    key: value for key, value in modified_assumptions.items() if key in allowed_kwargs and value is not None
+                }
+                risk_input = replace(risk, wacc=float(val)) if param == "wacc" else risk
+                result = valuation_func(validated, risk_input, **call_kwargs)
                 results.append((float(val), float(result.intrinsic_value)))
             except Exception as e:
                 logger.warning(f"Error evaluating {param} = {val}: {e}")
@@ -176,7 +192,13 @@ def tornado_analysis(
         Dict[str, float]: Impact of each parameter on valuation
     """
     tornado_results = {}
-    base_value = base_result.intrinsic_value
+    sig = inspect.signature(valuation_func)
+    allowed_kwargs = {
+        name
+        for name, param in sig.parameters.items()
+        if name not in {"validated", "risk"}
+        and param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
 
     for param in parameters:
         base_param_value = base_result.assumptions.get(param, 0.05)
@@ -186,11 +208,19 @@ def tornado_analysis(
         try:
             modified_lower = base_result.assumptions.copy()
             modified_lower[param] = lower_value
-            lower_result = valuation_func(validated, risk, **modified_lower)
+            lower_kwargs = {
+                key: value for key, value in modified_lower.items() if key in allowed_kwargs and value is not None
+            }
+            lower_risk = replace(risk, wacc=float(lower_value)) if param == "wacc" else risk
+            lower_result = valuation_func(validated, lower_risk, **lower_kwargs)
 
             modified_upper = base_result.assumptions.copy()
             modified_upper[param] = upper_value
-            upper_result = valuation_func(validated, risk, **modified_upper)
+            upper_kwargs = {
+                key: value for key, value in modified_upper.items() if key in allowed_kwargs and value is not None
+            }
+            upper_risk = replace(risk, wacc=float(upper_value)) if param == "wacc" else risk
+            upper_result = valuation_func(validated, upper_risk, **upper_kwargs)
 
             min_val = min(lower_result.intrinsic_value, upper_result.intrinsic_value)
             max_val = max(lower_result.intrinsic_value, upper_result.intrinsic_value)

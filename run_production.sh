@@ -100,18 +100,19 @@ check_env() {
     REQUIRED_VARS=("TUSHARE_TOKEN")
     
     for var in "${REQUIRED_VARS[@]}"; do
-        if [ -z "${!var}" ]; then
+        if [ -z "${!var:-}" ]; then
             if [ -f "$PROJECT_ROOT/.env" ]; then
                 info "从 .env 文件读取环境变量..."
-                while IFS= read -r line; do
-                    if [[ "$line" == *"$var"* ]]; then
-                        export "$line"
-                        info "已加载 $var"
-                    fi
-                done < "$PROJECT_ROOT/.env"
+                env_value=$(grep -E "^${var}=" "$PROJECT_ROOT/.env" | tail -n 1 | cut -d '=' -f 2-)
+                env_value="${env_value%\"}"
+                env_value="${env_value#\"}"
+                if [ -n "$env_value" ]; then
+                    export "$var=$env_value"
+                    info "已加载 $var"
+                fi
             fi
             
-            if [ -z "${!var}" ]; then
+            if [ -z "${!var:-}" ]; then
                 error "缺少环境变量: $var"
                 warn "请在 .env 文件中设置或直接导出到环境变量"
                 return 1
@@ -120,7 +121,7 @@ check_env() {
     done
     
     # 验证TUSHARE token格式
-    if [ ${#TUSHARE_TOKEN} -lt 10 ]; then
+    if [ -z "${TUSHARE_TOKEN:-}" ] || [ ${#TUSHARE_TOKEN} -lt 10 ]; then
         error "TUSHARE_TOKEN格式不正确"
         return 1
     fi
@@ -311,8 +312,8 @@ main() {
             info "重启生产环境..."
             stop_streamlit
             sleep 3
-            start
-            return 0
+            main start
+            return $?
             ;;
             
         help|--help|-h)
@@ -332,12 +333,12 @@ main() {
 exec 3>&1 4>&2
 exec 1>>"$LOG_FILE" 2>&1
 {
-    info "="*60
+    info "============================================================"
     info "A股绝对估值系统 - 生产环境启动"
     info "启动时间: $(date '+%Y-%m-%d %H:%M:%S')"
     info "项目目录: $PROJECT_ROOT"
     info "日志文件: $LOG_FILE"
-    info "="*60
+    info "============================================================"
     info ""
     
     # 执行主函数
@@ -346,7 +347,7 @@ exec 1>>"$LOG_FILE" 2>&1
     
     info ""
     info "执行完成，返回代码: $EXIT_CODE"
-    info "="*60
+    info "============================================================"
     
 } 3>&1 4>&2
 
