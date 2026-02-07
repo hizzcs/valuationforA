@@ -1,0 +1,84 @@
+# 生产环境配置
+app:
+  title: "A股绝对估值 - 投资经理工作台"
+  page_config:
+    layout: "wide"
+    initial_sidebar_state: "expanded"
+    menu_items:
+      About: "A股绝对估值系统 - 生产环境版本"
+
+data:
+  cache_dir: "./cache"
+  duckdb_path: "./duckdb/valuation.duckdb"
+  fixtures_dir: "./tests/data"
+  timeout: 30
+  retry_attempts: 3
+  retry_delay: 2
+
+validation:
+  quality_grades: ["A", "B", "C", "D"]
+  data_checks:
+    - "revenue_positive"
+    - "net_profit_accuracy"
+    - "debt_equity_ratio"
+    - "cash_flow_consistency"
+    - "gross_margin_range"
+    - "inventory_turnover"
+  alert_thresholds:
+    data_quality_grade: "C"
+    revenue_growth: [-0.1, 0.5]
+    debt_equity_ratio: 2.0
+
+valuation:
+  default_scenarios: 5000
+  confidence_levels: [0.05, 0.5, 0.95]
+  monte_carlo:
+    seed: 42
+    max_iterations: 10000
+    convergence_tolerance: 0.01
+  industry_adjustment: true
+  terminal_growth: 0.02
+
+reporting:
+  include_metrics:
+    - "data_quality_grade"
+    - "source_mode"
+    - "beta"
+    - "wacc"
+    - "terminal_growth"
+  output_formats: ["pdf", "excel", "json"]
+  report_dir: "./reports"
+  chart_styles: "professional"
+
+monitoring:
+  enabled: true
+  log_level: "INFO"
+  log_format: "json"
+  retention_days: 30
+  performance_metrics: ["response_time", "throughput", "error_rate"]
+
+security:
+  allow_remote_access: false
+  api_keys: {}
+  cors_allowed_origins: ["http://localhost:8502"]
+  session_timeout: 3600
+
+notifications:
+  enabled: false
+  email:
+    smtp_server: "smtp.gmail.com"
+    smtp_port: 587
+    use_ssl: true
+    username: ""
+    password: ""
+  slack:
+    webhook_url: ""
+    channel: "#valuation"
+
+alerts:
+  enabled: true
+  thresholds:
+    valuation_spread: 0.3
+    data_quality_drop: "B"
+    beta_outlier: 3.0
+  notification_methods: ["email"]
