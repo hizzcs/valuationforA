@@ -32,3 +32,6 @@ reports/
 
 # Cache
 cache/
+
+# Local MCP deployments
+tools/mcp/

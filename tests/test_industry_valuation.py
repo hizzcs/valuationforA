@@ -21,7 +21,7 @@ class IndustryValuationTest(unittest.TestCase):
     """Industry valuation tests."""
 
     def setUp(self) -> None:
-        self.client = TuShareClient(token=None, fixtures_dir=Path("tests/data"))
+        self.client = TuShareClient(token="", fixtures_dir=Path("tests/data"))
         self.ticker = "600000.SH"  # 浦发银行，属于金融行业
         self.as_of = date(2024, 12, 31)
 

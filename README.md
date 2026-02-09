@@ -24,6 +24,44 @@
 
 即使缺少 Token，也会自动落到 `tests/data/*.csv` 的离线样本；Streamlit UI 会显示“fixture mode” 徽章提醒数据来源。
 
+## Token 刷新（第三方网关）
+
+当出现 `您的token不对，请确认。` 时，可用脚本刷新并写入 `.env`：
+
+```bash
+./scripts/refresh_tushare_token.sh --key 你的网关key --print-export
+```
+
+仅测试获取，不改 `.env`：
+
+```bash
+./scripts/refresh_tushare_token.sh --key 你的网关key --dry-run
+```
+
+## 部署 TuShare MCP（本地）
+
+如果需要在本机通过 MCP 方式调用 TuShare：
+
+```bash
+mkdir -p tools/mcp
+git clone https://github.com/zhewenzhang/tushare_MCP.git tools/mcp/tushare_MCP
+cd tools/mcp/tushare_MCP
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.txt
+```
+
+启动（自动读取项目根目录 `.env` 中的 `TUSHARE_TOKEN`）：
+
+```bash
+cd /Users/zheng/Documents/valuation_ashare
+./scripts/start_tushare_mcp.sh
+```
+
+## 代码后缀提示（SH/SZ）
+
+- A股代码必须带交易所后缀，例如 `000933.SZ`、`600570.SH`。
+- 系统支持后缀自动纠错：如果 `SH` 无数据会自动尝试 `SZ`（反之亦然），并在界面提示实际使用代码。
+
 ## 常见问题
 
 - 启动后没有自动打开浏览器：

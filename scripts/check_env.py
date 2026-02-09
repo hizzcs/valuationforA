@@ -19,10 +19,18 @@ try:
 except Exception:  # pragma: no cover
     duckdb = None  # type: ignore
 
-from src.data_pipeline import DUCKDB_PATH, TuShareClient, ensure_duckdb_schema  # noqa: E402
+from src.data_pipeline import DUCKDB_PATH, TuShareClient, _load_env_token, ensure_duckdb_schema  # noqa: E402
 
-REQUIRED_ENDPOINTS: Dict[str, Dict[str, object]] = {
+LIVE_ENDPOINTS: Dict[str, Dict[str, object]] = {
     "daily": {"ts_code": "600000.SH", "limit": 50},
+    "income": {"ts_code": "600000.SH", "limit": 20},
+    "cashflow": {"ts_code": "600000.SH", "limit": 20},
+    "balancesheet": {"ts_code": "600000.SH", "limit": 20},
+    "daily_basic": {"ts_code": "600000.SH", "limit": 50},
+}
+
+FIXTURE_ENDPOINTS: Dict[str, Dict[str, object]] = {
+    "daily": {"ts_code": "600000.SH"},
     "financials": {"ts_code": "600000.SH"},
     "macro": {},
     "bonds": {},
@@ -55,15 +63,16 @@ REQUIRED_TABLES = {
 
 
 def main() -> int:
-    token = os.getenv("TUSHARE_TOKEN")
+    token = os.getenv("TUSHARE_TOKEN") or _load_env_token()
     if token:
         logger.info("TUSHARE_TOKEN detected; attempting live connectivity.")
     else:
         logger.warning("TUSHARE_TOKEN missing; validation will use fixtures.")
 
     client = TuShareClient(token=token)
+    required_endpoints = LIVE_ENDPOINTS if token else FIXTURE_ENDPOINTS
     endpoint_failures: List[str] = []
-    for endpoint, params in REQUIRED_ENDPOINTS.items():
+    for endpoint, params in required_endpoints.items():
         try:
             df = client.call_api(endpoint, **params)
             mode = client.last_call.get("mode", client.mode)

@@ -122,13 +122,101 @@ class TuShareClient:
     def mode(self) -> str:
         return "live" if self._pro is not None else "fixture"
 
+    @staticmethod
+    def _quarter_end_date(quarter: str) -> Optional[pd.Timestamp]:
+        if not isinstance(quarter, str) or "Q" not in quarter:
+            return None
+        try:
+            year = int(quarter[:4])
+            q = int(quarter[-1])
+            if q == 1:
+                return pd.Timestamp(year=year, month=3, day=31)
+            if q == 2:
+                return pd.Timestamp(year=year, month=6, day=30)
+            if q == 3:
+                return pd.Timestamp(year=year, month=9, day=30)
+            if q == 4:
+                return pd.Timestamp(year=year, month=12, day=31)
+        except Exception:
+            return None
+        return None
+
+    def _call_live_alias(self, endpoint: str, params: Dict[str, object]) -> Optional[pd.DataFrame]:
+        if self._pro is None:
+            return None
+
+        if endpoint == "csi300":
+            # Official CSI300 endpoint.
+            query = {"ts_code": "000300.SH"}
+            if "start_date" in params:
+                query["start_date"] = params["start_date"]
+            if "end_date" in params:
+                query["end_date"] = params["end_date"]
+            if "limit" in params:
+                query["limit"] = params["limit"]
+            return pd.DataFrame(self._pro.index_daily(**query))
+
+        if endpoint == "bonds":
+            # 国债收益率曲线，提取接近10Y点并转换成小数（如 2.1 -> 0.021）
+            query = {"curve_type": "0"}
+            if "limit" in params:
+                query["limit"] = params["limit"]
+            if "start_date" in params:
+                query["start_date"] = params["start_date"]
+            if "end_date" in params:
+                query["end_date"] = params["end_date"]
+            tenor = float(params.get("tenor", 10))
+            raw = pd.DataFrame(self._pro.yc_cb(**query))
+            if raw.empty:
+                return raw
+            raw["trade_date"] = pd.to_datetime(raw["trade_date"], format="%Y%m%d", errors="coerce")
+            raw["curve_term"] = pd.to_numeric(raw.get("curve_term"), errors="coerce")
+            raw["yield"] = pd.to_numeric(raw.get("yield"), errors="coerce")
+            raw = raw.dropna(subset=["trade_date", "curve_term", "yield"])
+            if raw.empty:
+                return pd.DataFrame(columns=["obs_date", "value", "curve_term", "curve_name", "ts_code"])
+            raw["term_distance"] = (raw["curve_term"] - tenor).abs()
+            selected = (
+                raw.sort_values(["trade_date", "term_distance"])
+                .groupby("trade_date", as_index=False)
+                .first()
+            )
+            out = selected.rename(columns={"trade_date": "obs_date", "yield": "value"})
+            out["value"] = out["value"] / 100
+            return out[["obs_date", "value", "curve_term", "curve_name", "ts_code"]]
+
+        if endpoint == "macro":
+            # 优先 GDP 同比，作为估值场景宏观因子；为空则退回 CPI 同比。
+            gdp = pd.DataFrame(self._pro.cn_gdp())
+            if not gdp.empty:
+                gdp["obs_date"] = gdp["quarter"].map(self._quarter_end_date)
+                gdp["value"] = pd.to_numeric(gdp.get("gdp_yoy"), errors="coerce") / 100
+                gdp = gdp.dropna(subset=["obs_date", "value"])
+                if not gdp.empty:
+                    gdp["series"] = "gdp_yoy"
+                    return gdp[["series", "obs_date", "value"]]
+            cpi = pd.DataFrame(self._pro.cn_cpi())
+            if cpi.empty:
+                return pd.DataFrame(columns=["series", "obs_date", "value"])
+            cpi["obs_date"] = pd.to_datetime(cpi["month"], format="%Y%m", errors="coerce")
+            cpi["value"] = pd.to_numeric(cpi.get("nt_yoy"), errors="coerce") / 100
+            cpi = cpi.dropna(subset=["obs_date", "value"])
+            cpi["series"] = "cpi_yoy"
+            return cpi[["series", "obs_date", "value"]]
+
+        return None
+
     def call_api(self, endpoint: str, **params) -> pd.DataFrame:
         start = datetime.now(timezone.utc)
         cache_key = _hash_params(endpoint, params)
         if self._pro is not None:
             try:
-                func = getattr(self._pro, endpoint)
-                df = func(**params)
+                alias_df = self._call_live_alias(endpoint, params)
+                if alias_df is not None:
+                    df = alias_df
+                else:
+                    func = getattr(self._pro, endpoint)
+                    df = func(**params)
                 duration = (datetime.now(timezone.utc) - start).total_seconds()
                 self.last_call = {
                     "endpoint": endpoint,
@@ -355,16 +443,153 @@ def cache_dataframe(table: str, df: pd.DataFrame, path: Path = DUCKDB_PATH) -> N
         con.close()
 
 
+def _safe_call_api(client: TuShareClient, endpoint: str, **params) -> pd.DataFrame:
+    """Best-effort endpoint call that returns an empty frame on failure."""
+    try:
+        return client.call_api(endpoint, **params)
+    except Exception as exc:  # pragma: no cover - defensive runtime path
+        logger.warning("Endpoint {} unavailable for {}: {}", endpoint, params.get("ts_code", ""), exc)
+        return pd.DataFrame()
+
+
+def _normalize_end_date(series: pd.Series) -> pd.Series:
+    parsed = pd.to_datetime(series, format="%Y%m%d", errors="coerce")
+    if parsed.notna().any():
+        return parsed
+    return pd.to_datetime(series, errors="coerce")
+
+
+def _coalesce_numeric(frame: pd.DataFrame, candidates: list[str]) -> pd.Series:
+    if frame.empty:
+        return pd.Series(dtype=float)
+    out = pd.Series(index=frame.index, dtype=float)
+    for col in candidates:
+        if col in frame.columns:
+            out = out.fillna(pd.to_numeric(frame[col], errors="coerce"))
+    return out
+
+
+def _alternate_ts_code(ticker: str) -> Optional[str]:
+    upper = ticker.upper()
+    if upper.endswith(".SH"):
+        return f"{upper[:-3]}.SZ"
+    if upper.endswith(".SZ"):
+        return f"{upper[:-3]}.SH"
+    return None
+
+
+def _load_financials_from_standard_endpoints(client: TuShareClient, ticker: str) -> pd.DataFrame:
+    """Build a normalized financials frame from official TuShare endpoints."""
+    income = _safe_call_api(client, "income", ts_code=ticker)
+    cashflow = _safe_call_api(client, "cashflow", ts_code=ticker)
+    balance = _safe_call_api(client, "balancesheet", ts_code=ticker)
+
+    parts: list[pd.DataFrame] = []
+
+    if not income.empty and "end_date" in income.columns:
+        frame = pd.DataFrame(
+            {
+                "ts_code": income.get("ts_code", ticker),
+                "end_date": _normalize_end_date(income["end_date"]),
+                "revenue": _coalesce_numeric(income, ["revenue", "total_revenue"]),
+                "net_profit": _coalesce_numeric(income, ["n_income_attr_p", "n_income", "net_profit"]),
+                "interest_expense": _coalesce_numeric(income, ["fin_exp_int_exp", "int_exp", "fin_exp"]),
+            }
+        )
+        parts.append(frame)
+
+    if not cashflow.empty and "end_date" in cashflow.columns:
+        frame = pd.DataFrame(
+            {
+                "ts_code": cashflow.get("ts_code", ticker),
+                "end_date": _normalize_end_date(cashflow["end_date"]),
+                "operating_cf": _coalesce_numeric(cashflow, ["n_cashflow_act", "operate_cashflow", "operating_cf"]),
+            }
+        )
+        parts.append(frame)
+
+    if not balance.empty and "end_date" in balance.columns:
+        total_liab = _coalesce_numeric(balance, ["total_liab", "total_debt"])
+        money_cap = _coalesce_numeric(balance, ["money_cap"])
+        total_assets = _coalesce_numeric(balance, ["total_assets"])
+        equity = _coalesce_numeric(balance, ["total_hldr_eqy_inc_min_int", "total_hldr_eqy_exc_min_int"])
+
+        invested = total_assets.where(total_assets.notna(), total_liab + equity)
+        net_debt = total_liab.where(total_liab.notna(), pd.Series(index=balance.index, dtype=float)) - money_cap.fillna(0.0)
+
+        frame = pd.DataFrame(
+            {
+                "ts_code": balance.get("ts_code", ticker),
+                "end_date": _normalize_end_date(balance["end_date"]),
+                "net_debt": net_debt,
+                "invested_capital": invested,
+                "total_debt": total_liab,
+                "shares_outstanding": _coalesce_numeric(balance, ["total_share", "shares_outstanding"]),
+            }
+        )
+        parts.append(frame)
+
+    if not parts:
+        return pd.DataFrame()
+
+    merged = parts[0]
+    for part in parts[1:]:
+        merged = merged.merge(part, on=["ts_code", "end_date"], how="outer")
+
+    merged["ts_code"] = merged["ts_code"].fillna(ticker)
+    merged = merged.dropna(subset=["end_date"]).sort_values("end_date")
+    merged = merged.drop_duplicates(subset=["ts_code", "end_date"], keep="last").reset_index(drop=True)
+    return merged
+
+
 def load_financials(client: TuShareClient, ticker: str, as_of: Optional[date] = None) -> pd.DataFrame:
-    df = client.call_api("financials", ts_code=ticker)
+    requested_ticker = ticker.upper()
+    resolved_ticker = requested_ticker
+
+    # Live mode: use official TuShare statements first.
+    df = _load_financials_from_standard_endpoints(client, requested_ticker) if client.mode == "live" else pd.DataFrame()
+
+    if df.empty:
+        alt = _alternate_ts_code(requested_ticker)
+        if alt:
+            alt_df = _load_financials_from_standard_endpoints(client, alt) if client.mode == "live" else pd.DataFrame()
+            if not alt_df.empty:
+                logger.warning("No financials for {}; using alternate ticker {}.", requested_ticker, alt)
+                df = alt_df
+                resolved_ticker = alt
+
+    # Fixture/backward fallback
+    if df.empty:
+        # Fixture mode fallback only.
+        if client.mode != "live":
+            df = _safe_call_api(client, "financials", ts_code=requested_ticker)
+            if not df.empty:
+                resolved_ticker = requested_ticker
+
+    if df.empty and client.mode != "live":
+        alt = _alternate_ts_code(requested_ticker)
+        if alt:
+            alt_df = _safe_call_api(client, "financials", ts_code=alt)
+            if not alt_df.empty:
+                logger.warning("No financials fixture for {}; using alternate ticker {}.", requested_ticker, alt)
+                df = alt_df
+                resolved_ticker = alt
+
     if df.empty:
         return df
-    df["end_date"] = pd.to_datetime(df["end_date"])
+
+    df["end_date"] = _normalize_end_date(df["end_date"])
+    df = df.dropna(subset=["end_date"])
     if as_of is not None:
         df = df[df["end_date"] <= pd.Timestamp(as_of)]
     if df.empty:
         return df
     df = df.sort_values("end_date")
+    if "ts_code" not in df.columns:
+        df["ts_code"] = resolved_ticker
+    else:
+        df["ts_code"] = df["ts_code"].fillna(resolved_ticker)
+
     for col in ["revenue", "net_profit", "net_debt", "operating_cf", "invested_capital"]:
         if col in df:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -376,10 +601,24 @@ def load_financials(client: TuShareClient, ticker: str, as_of: Optional[date] = 
 
 
 def load_prices(client: TuShareClient, ticker: str, as_of: Optional[date] = None) -> pd.DataFrame:
-    df = client.call_api("daily", ts_code=ticker)
+    requested_ticker = ticker.upper()
+    df = _safe_call_api(client, "daily", ts_code=requested_ticker)
+    if df.empty:
+        alt = _alternate_ts_code(requested_ticker)
+        if alt:
+            alt_df = _safe_call_api(client, "daily", ts_code=alt)
+            if not alt_df.empty:
+                logger.warning("No price data for {}; using alternate ticker {}.", requested_ticker, alt)
+                df = alt_df
+
+    if df.empty or "trade_date" not in df.columns:
+        return pd.DataFrame(columns=["ts_code", "trade_date", "close"])
+
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     if as_of is not None:
         df = df[df["trade_date"] <= pd.Timestamp(as_of)]
+    if "ts_code" not in df.columns:
+        df["ts_code"] = requested_ticker
     df = df.sort_values("trade_date")[["ts_code", "trade_date", "close"]]
     cache_dataframe("raw_prices", df.rename(columns={"ts_code": "ticker"}))
     return df
@@ -399,6 +638,8 @@ def load_inputs(client: Optional[TuShareClient], ticker: str, as_of: date) -> Va
     fin = load_financials(client, ticker, as_of=as_of)
     if fin.empty:
         raise ValueError(f"No financial statements available for {ticker} on or before {as_of}")
+    resolved_ticker = str(fin.iloc[-1].get("ts_code", ticker)).strip() or ticker
+    resolved_ticker = resolved_ticker.upper()
     latest = fin.iloc[-1]
     previous = fin.iloc[-2] if len(fin) > 1 else latest
     verification: Dict[str, str] = {}
@@ -447,7 +688,7 @@ def load_inputs(client: Optional[TuShareClient], ticker: str, as_of: date) -> Va
 
         # Fallback to daily_basic when financial statements don't carry share count.
         try:
-            daily_basic = client.call_api("daily_basic", ts_code=ticker)
+            daily_basic = client.call_api("daily_basic", ts_code=resolved_ticker)
             if not daily_basic.empty:
                 basic = daily_basic.copy()
                 if "trade_date" in basic.columns:
@@ -511,6 +752,8 @@ def load_inputs(client: Optional[TuShareClient], ticker: str, as_of: date) -> Va
     metadata = {
         "source": "tushare" if source_mode == "live" else source_mode,
         "source_mode": source_mode,
+        "requested_ticker": ticker.upper(),
+        "resolved_ticker": resolved_ticker,
         "statement_end_date": str(statement_end),
         "statement_rows": str(len(fin)),
         "verification_summary": f"pass:{passes}|warn:{warns}|fail:{fails}",
@@ -522,7 +765,7 @@ def load_inputs(client: Optional[TuShareClient], ticker: str, as_of: date) -> Va
         metadata["fixture_dir"] = str(client.fixtures_dir)
     if not industry:
         try:
-            basic = client.call_api("stock_basic", ts_code=ticker)
+            basic = client.call_api("stock_basic", ts_code=resolved_ticker)
             if not basic.empty:
                 metadata["industry"] = str(
                     basic.iloc[0].get("industry", basic.iloc[0].get("industry_name", ""))
@@ -531,7 +774,7 @@ def load_inputs(client: Optional[TuShareClient], ticker: str, as_of: date) -> Va
             pass
 
     return ValidatedInputs(
-        ticker=ticker,
+        ticker=resolved_ticker,
         as_of_date=as_of,
         revenue=revenue,
         net_profit=net_profit,

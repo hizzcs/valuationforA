@@ -8,7 +8,7 @@ from src.data_pipeline import TuShareClient, load_inputs
 
 class DataVerificationTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.client = TuShareClient(token=None, fixtures_dir=Path("tests/data"))
+        self.client = TuShareClient(token="", fixtures_dir=Path("tests/data"))
 
     def test_load_inputs_outputs_grade(self) -> None:
         with patch("src.data_pipeline.cache_dataframe", return_value=None):

@@ -12,7 +12,7 @@ from src.valuation_core import roic_driven_dcf
 
 class RoicDriverTest(unittest.TestCase):
     def test_roic_and_reinvestment_populate_assumptions(self) -> None:
-        client = TuShareClient(token=None, fixtures_dir=Path("tests/data"))
+        client = TuShareClient(token="", fixtures_dir=Path("tests/data"))
         ticker = "600000.SH"
         as_of = date(2024, 12, 31)
         with patch("src.data_pipeline.cache_dataframe", return_value=None):

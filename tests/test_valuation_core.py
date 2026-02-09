@@ -13,7 +13,7 @@ from src.valuation_core import revenue_driven_dcf, roic_driven_dcf, two_stage_dc
 
 class ValuationCoreTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.client = TuShareClient(token=None, fixtures_dir=Path("tests/data"))
+        self.client = TuShareClient(token="", fixtures_dir=Path("tests/data"))
         self.ticker = "600000.SH"
         self.as_of = date(2024, 12, 31)
 
